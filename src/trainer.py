@@ -798,7 +798,6 @@ class SingleTrainer(Trainer):
 
         super().__init__(data, params)
 
-
 class EncDecTrainer(Trainer):
 
     def __init__(self, encoder, decoder, data, params):
@@ -933,3 +932,65 @@ class EncDecTrainer(Trainer):
         self.n_sentences += params.batch_size
         self.stats['processed_s'] += len1.size(0)
         self.stats['processed_w'] += (len1 - 1).sum().item()
+
+class WikisumTrainer(EncDecTrainer):
+    def __init__(self, dataloader, encoder, decoder, data, params):
+        self.dataloader=dataloader
+        self.iterator=None
+
+        super().__init__(encoder, decoder, data, params)
+
+    def get_batch(self):
+        if self.iterator is None:
+            self.iterator=self.dataloader.__iter__()
+
+        try:
+            x = next(self.iterator)
+        except StopIteration:
+            self.iterator=self.dataloader.__iter__()
+            x = next(self.iterator)
+
+        return x
+
+    def step(self, lang1, lang2):
+        params = self.params
+        self.encoder.train()
+        self.decoder.train()
+
+        lang1_id = params.lang2id[lang1]
+        lang2_id = params.lang2id[lang2]
+
+        # generate batch
+        (x1, len1), (x2, len2) = self.get_batch()
+        langs1 = x1.clone().fill_(lang1_id)
+        langs2 = x2.clone().fill_(lang2_id)
+
+        # target words to predict
+        alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
+        pred_mask = alen[:, None] < len2[None] - 1  # do not predict anything given the last target word
+        y = x2[1:].masked_select(pred_mask[:-1])
+        assert len(y) == (len2 - 1).sum().item()
+
+        # cuda
+        x1, len1, langs1 = [t.cuda(0) for t in [x1, len1, langs1]]
+
+        # encode source sentence
+        enc1 = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
+        enc1 = enc1.transpose(0, 1)
+
+        enc1, len1, x2, len2, langs2, pred_mask, y=[t.cuda(1) for t in [enc1, len1, x2, len2, langs2, pred_mask, y]]
+
+        # decode target sentence
+        dec2 = self.decoder('fwd', x=x2, lengths=len2, langs=langs2, causal=True, src_enc=enc1, src_len=len1)
+
+        # loss
+        _, loss = self.decoder('predict', tensor=dec2, pred_mask=pred_mask, y=y, get_scores=False)
+        self.stats[('Wikisum-%s-%s' % (lang1, lang2))].append(loss.item())
+
+        # optimize
+        self.optimize(loss)
+
+        # number of processed sentences / words
+        self.n_sentences += params.batch_size
+        self.stats['processed_s'] += len2.size(0)
+        self.stats['processed_w'] += (len2 - 1).sum().item()

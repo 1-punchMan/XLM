@@ -25,7 +25,6 @@ SPECIAL_WORDS = 10
 SEP_WORD = SPECIAL_WORD % 0
 MASK_WORD = SPECIAL_WORD % 1
 
-
 class Dictionary(object):
 
     def __init__(self, id2word, word2id, counts):
@@ -224,5 +223,59 @@ class Dictionary(object):
         if bin_path is not None:
             print("Saving the data to %s ..." % bin_path)
             torch.save(data, bin_path, pickle_protocol=4)
+
+        return data
+
+    @staticmethod
+    def index_sentences(lines, dico):
+        """
+        Index sentences with a dictionary.
+        Input sentences come from string parameter, may be multiple paragraphs.
+        """
+        # BOS都用EOS
+        # 模型的輸入開頭都加上EOS，而非每個句子開頭。
+        sentences = [dico.eos_index]
+        unk_words = {}
+
+        # index sentences
+        for i, line in enumerate(lines):
+            if i % 1000000 == 0 and i > 0:
+                print(i)
+            s = line.rstrip().split()
+            # skip empty sentences
+            if len(s) == 0:
+                print("Empty sentence in line %i." % i)
+            # index sentence words
+            count_unk = 0
+            indexed = []
+            for w in s:
+                word_id = dico.index(w, no_unk=False)
+                # if we find a special word which is not an unknown word, skip the sentence
+                if 0 <= word_id < 4 + SPECIAL_WORDS and word_id != 3:
+                    logger.warning('Found unexpected special word "%s" (%i)!!' % (w, word_id))
+                    continue
+                assert word_id >= 0
+                indexed.append(word_id)
+                if word_id == dico.unk_index:
+                    unk_words[w] = unk_words.get(w, 0) + 1
+                    count_unk += 1
+            # add sentence
+            sentences.extend(indexed)
+            sentences.append(dico.eos_index)  # EOS index
+
+        # tensorize data
+        # 為節省空間，利用numpy的int32等型別儲存資料
+        # 轉torch.tensor時要注意，參考XLM/src/data/dataset.py的batch_sentences()
+        if len(dico) < 1 << 16:
+            sentences = np.uint16(sentences)
+        elif len(dico) < 1 << 31:
+            sentences = np.int32(sentences)
+        else:
+            raise Exception("Dictionary is too big.")
+        assert sentences.min() >= 0
+        data = {
+            'sentences': sentences,
+            'unk_words': unk_words,
+        }
 
         return data

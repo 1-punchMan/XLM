@@ -157,7 +157,7 @@ def build_model(params, dico):
             # reload encoder
             if enc_path != '':
                 logger.info("Reloading encoder from %s ..." % enc_path)
-                enc_reload = torch.load(enc_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
+                enc_reload = torch.load(enc_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))    #params.local_rank=-1, no-op
                 enc_reload = enc_reload['model' if 'model' in enc_reload else 'encoder']
                 if all([k.startswith('module.') for k in enc_reload.keys()]):
                     enc_reload = {k[len('module.'):]: v for k, v in enc_reload.items()}
@@ -182,4 +182,4 @@ def build_model(params, dico):
         logger.info("Number of parameters (encoder): %i" % sum([p.numel() for p in encoder.parameters() if p.requires_grad]))
         logger.info("Number of parameters (decoder): %i" % sum([p.numel() for p in decoder.parameters() if p.requires_grad]))
 
-        return encoder.cuda(), decoder.cuda()
+        return encoder.cuda(0), decoder.cuda(1)
