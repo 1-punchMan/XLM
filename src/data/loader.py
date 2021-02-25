@@ -12,7 +12,7 @@ import torch
 
 from .dataset import StreamDataset, Dataset, ParallelDataset
 from .dictionary import BOS_WORD, EOS_WORD, PAD_WORD, UNK_WORD, MASK_WORD
-
+from torch.utils.data import Dataset as Torch_dataset
 
 logger = getLogger()
 
@@ -348,4 +348,23 @@ def load_data(params):
             logger.info('{: <18} - {: >5} - {: >12}:{: >10}'.format('Parallel data', data_set, '%s-%s' % (src, tgt), len(v[data_set])))
 
     logger.info("")
+    return data
+
+class Wikisum_Dataset(Torch_dataset):
+    def __init__(self):
+
+    def __getitem__(self, index):
+
+    def __len__(self):
+        return len(self.)
+
+def load_wikisum_data(dico_path, dataset_path):
+    """
+    Load Wikisum data.
+    The returned dictionary contains:
+        - dico (dictionary)
+        - train / valid / test datasets
+    """
+
+
     return data

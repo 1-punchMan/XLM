@@ -10,7 +10,7 @@ import random
 import argparse
 
 from src.slurm import init_signal_handler, init_distributed_mode
-from src.data.loader import check_data_params, load_data
+from src.data.loader import check_data_params, load_data, load_wikisum_data
 from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
 from src.model import check_model_params, build_model
 from src.model.memory import HashingMemory
@@ -227,7 +227,7 @@ def main(params):
     init_signal_handler()
 
     # load data
-    data = load_data(params)
+    data = load_wikisum_data(dico_path, dataset_path)
 
     # build model
     if params.encoder_only:
@@ -236,12 +236,8 @@ def main(params):
         encoder, decoder = build_model(params, data['dico'])
 
     # build trainer, reload potential checkpoints / build evaluator
-    if params.encoder_only:
-        trainer = SingleTrainer(model, data, params)
-        evaluator = SingleEvaluator(trainer, data, params)
-    else:
-        trainer = EncDecTrainer(encoder, decoder, data, params)
-        evaluator = EncDecEvaluator(trainer, data, params)
+    trainer = WikisumTrainer(encoder, decoder, data, params)
+    # evaluator = WikisumEvaluator(trainer, data, params)
 
     # evaluation
     if params.eval_only:

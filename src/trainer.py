@@ -22,6 +22,7 @@ from .utils import to_cuda, concat_batches, find_modules
 from .utils import parse_lambda_config, update_lambdas
 from .model.memory import HashingMemory
 from .model.transformer import TransformerFFN
+from torch.utils.data import DataLoader
 
 
 logger = getLogger()
@@ -934,8 +935,8 @@ class EncDecTrainer(Trainer):
         self.stats['processed_w'] += (len1 - 1).sum().item()
 
 class WikisumTrainer(EncDecTrainer):
-    def __init__(self, dataloader, encoder, decoder, data, params):
-        self.dataloader=dataloader
+    def __init__(self, encoder, decoder, data, params):
+        self.dataloader=DataLoader(training_set, batch_size=batch_size, shuffle=True, drop_last=True)
         self.iterator=None
 
         super().__init__(encoder, decoder, data, params)
