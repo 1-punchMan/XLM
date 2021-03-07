@@ -6,12 +6,11 @@
 #
 
 from logging import getLogger
-import os
-import numpy as np
+import os, numpy as np, json, pickle
 import torch
 
 from .dataset import StreamDataset, Dataset, ParallelDataset
-from .dictionary import BOS_WORD, EOS_WORD, PAD_WORD, UNK_WORD, MASK_WORD
+from .dictionary import BOS_WORD, EOS_WORD, PAD_WORD, UNK_WORD, MASK_WORD, Dictionary
 from torch.utils.data import Dataset as Torch_dataset
 
 logger = getLogger()
@@ -282,6 +281,9 @@ def check_data_params(params):
     assert len(params.bt_steps) == 0 or not params.encoder_only
     params.bt_src_langs = [l1 for l1, _, _ in params.bt_steps]
 
+    # Wikisum steps
+    params.ws_steps = [tuple(s.split('-')) for s in params.ws_steps.split(',') if len(s) > 0]
+
     # check monolingual datasets
     required_mono = set([l1 for l1, l2 in (params.mlm_steps + params.clm_steps) if l2 is None] + params.ae_steps + params.bt_src_langs)
     params.mono_dataset = {
@@ -351,20 +353,85 @@ def load_data(params):
     return data
 
 class Wikisum_Dataset(Torch_dataset):
-    def __init__(self):
+    def __init__(self, data_list, dataset_path, n_paragraphs, maxlen):
+        self.data=data_list
+        self.dataset_path=dataset_path
+        self.n_paragraphs=n_paragraphs
+        self.maxlen=maxlen
 
     def __getitem__(self, index):
+        n_file, pos, length=self.data[index]
+        file=f"{self.dataset_path}/dataset-{n_file:>05}-of-01000.pkl"
+        with open(file, 'rb') as f:
+            f.seek(pos)
+            item=pickle.loads(f.read(length))
+
+        input_title=item["inputs"]["title"]["sentences"].astype(np.int64).tolist()
+
+        input=[input_title]
+        start, cnt, para_cnt, last=0, 0, 0, False
+        paragraphs=item["inputs"]["paragraphs"]["sentences"].astype(np.int64).tolist()
+        for i, token in enumerate(paragraphs):
+            if para_cnt >= self.n_paragraphs: break
+            cnt+=1
+            if cnt == self.maxlen:
+                # 加一段
+                end=i+1
+                input.append(paragraphs[start:end])
+                para_cnt+=1
+                if token == 1:
+                    start, cnt=i, 1
+                    last=False
+                else:
+                    start, cnt=i+1, 0
+                    last=True
+            elif token == 1 and i != 0:
+                if not last:
+                    # 加一段
+                    end=i+1
+                    input.append(paragraphs[start:end])
+                    para_cnt+=1
+                start, cnt=i, 1
+                last=False
+
+        if para_cnt < self.n_paragraphs:
+            less=self.n_paragraphs-para_cnt
+            input+=less*[[]]
+
+        target=item["targets"]["title"]["sentences"].astype(np.int64).tolist()
+        target+=item["targets"]["intro"]["sentences"].astype(np.int64).tolist()
+        target=target[:self.maxlen] if len(target) > self.maxlen else target
+        
+        return input, target
 
     def __len__(self):
-        return len(self.)
+        return len(self.data)
 
-def load_wikisum_data(dico_path, dataset_path):
+def load_wikisum_data(voc_path, dataset_path, params):
     """
     Load Wikisum data.
     The returned dictionary contains:
         - dico (dictionary)
-        - train / valid / test datasets
+        - training / valid / test datasets
     """
+    data={}
 
+    dictionary = Dictionary.read_vocab(voc_path)
+    set_dico_parameters(params, data, dictionary)
 
+    DATASET=[]  # 元素格式：(n_file, pos, length)
+    for n_file in range(1000):
+        file_path=f"{dataset_path}/index-{n_file:>05}-of-01000.json"
+        with open(file_path, 'r', encoding='utf-8') as f:
+            indices = json.load(f)
+
+        DATASET+=[(n_file, pos, length) for pos, length in indices]
+            
+    dataset=Wikisum_Dataset(DATASET, dataset_path, n_paragraphs=5, maxlen=params.bptt)
+    data["datasets"]={
+        "training": dataset,
+        "valid": None,
+        "test": None
+    }
+    
     return data

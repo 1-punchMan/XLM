@@ -23,7 +23,7 @@ from .utils import parse_lambda_config, update_lambdas
 from .model.memory import HashingMemory
 from .model.transformer import TransformerFFN
 from torch.utils.data import DataLoader
-
+from torch.nn.utils.rnn import pad_sequence
 
 logger = getLogger()
 
@@ -112,17 +112,18 @@ class Trainer(object):
         self.n_total_iter = 0
         self.n_sentences = 0
         self.stats = OrderedDict(
-            [('processed_s', 0), ('processed_w', 0)] +
-            [('CLM-%s' % l, []) for l in params.langs] +
-            [('CLM-%s-%s' % (l1, l2), []) for l1, l2 in data['para'].keys()] +
-            [('CLM-%s-%s' % (l2, l1), []) for l1, l2 in data['para'].keys()] +
-            [('MLM-%s' % l, []) for l in params.langs] +
-            [('MLM-%s-%s' % (l1, l2), []) for l1, l2 in data['para'].keys()] +
-            [('MLM-%s-%s' % (l2, l1), []) for l1, l2 in data['para'].keys()] +
-            [('PC-%s-%s' % (l1, l2), []) for l1, l2 in params.pc_steps] +
-            [('AE-%s' % lang, []) for lang in params.ae_steps] +
-            [('MT-%s-%s' % (l1, l2), []) for l1, l2 in params.mt_steps] +
-            [('BT-%s-%s-%s' % (l1, l2, l3), []) for l1, l2, l3 in params.bt_steps]
+            # [('processed_s', 0), ('processed_w', 0)] +
+            # [('CLM-%s' % l, []) for l in params.langs] +
+            # [('CLM-%s-%s' % (l1, l2), []) for l1, l2 in data['para'].keys()] +
+            # [('CLM-%s-%s' % (l2, l1), []) for l1, l2 in data['para'].keys()] +
+            # [('MLM-%s' % l, []) for l in params.langs] +
+            # [('MLM-%s-%s' % (l1, l2), []) for l1, l2 in data['para'].keys()] +
+            # [('MLM-%s-%s' % (l2, l1), []) for l1, l2 in data['para'].keys()] +
+            # [('PC-%s-%s' % (l1, l2), []) for l1, l2 in params.pc_steps] +
+            # [('AE-%s' % lang, []) for lang in params.ae_steps] +
+            # [('MT-%s-%s' % (l1, l2), []) for l1, l2 in params.mt_steps] +
+            # [('BT-%s-%s-%s' % (l1, l2, l3), []) for l1, l2, l3 in params.bt_steps]
+            [('WS-%s-%s' % (l1, l2), []) for l1, l2 in params.ws_steps]
         )
         self.last_time = time.time()
 
@@ -269,19 +270,19 @@ class Trainer(object):
         for k, v in self.optimizers.items():
             s_lr = s_lr + (" - %s LR: " % k) + " / ".join("{:.4e}".format(group['lr']) for group in v.param_groups)
 
-        # processing speed
-        new_time = time.time()
-        diff = new_time - self.last_time
-        s_speed = "{:7.2f} sent/s - {:8.2f} words/s - ".format(
-            self.stats['processed_s'] * 1.0 / diff,
-            self.stats['processed_w'] * 1.0 / diff
-        )
-        self.stats['processed_s'] = 0
-        self.stats['processed_w'] = 0
-        self.last_time = new_time
+        # # processing speed
+        # new_time = time.time()
+        # diff = new_time - self.last_time
+        # s_speed = "{:7.2f} sent/s - {:8.2f} words/s - ".format(
+        #     self.stats['processed_s'] * 1.0 / diff,
+        #     self.stats['processed_w'] * 1.0 / diff
+        # )
+        # self.stats['processed_s'] = 0
+        # self.stats['processed_w'] = 0
+        # self.last_time = new_time
 
         # log speed + stats + learning rate
-        logger.info(s_iter + s_speed + s_stat + s_lr)
+        logger.info(s_iter + s_stat + s_lr)
 
     def get_iterator(self, iter_name, lang1, lang2, stream):
         """
@@ -934,64 +935,93 @@ class EncDecTrainer(Trainer):
         self.stats['processed_s'] += len1.size(0)
         self.stats['processed_w'] += (len1 - 1).sum().item()
 
+def collate(samples, padding_value):
+    inputs = [s[0] for s in samples]
+    inputs=zip(*inputs)
+    
+    inputs, t, ilen=[], inputs, []
+    for inp in t:
+        lens=[len(sent) for sent in inp]
+        ilen.append(torch.LongTensor(lens))
+
+        seq=[torch.LongTensor(sent) for sent in inp]
+        seq = pad_sequence(seq, padding_value=padding_value)
+        inputs.append(seq)
+    
+    target = [s[1] for s in samples]
+    lens=[len(targ) for targ in target]
+    tlen=torch.LongTensor(lens)
+
+    target=[torch.LongTensor(targ) for targ in target]
+    target = pad_sequence(target, padding_value=padding_value)
+
+    return inputs, ilen, target, tlen
+    # inputs和target的size：(slen, bs)
+
 class WikisumTrainer(EncDecTrainer):
     def __init__(self, encoder, decoder, data, params):
-        self.dataloader=DataLoader(training_set, batch_size=batch_size, shuffle=True, drop_last=True)
+        pad_index=data["dico"].pad_index
+
+        self.dataloader=DataLoader(
+            data["datasets"]["training"],
+            batch_size=params.batch_size,
+            shuffle=True,
+            drop_last=True,
+            collate_fn=lambda samples: collate(samples, pad_index))
         self.iterator=None
 
         super().__init__(encoder, decoder, data, params)
 
-    def get_batch(self):
-        if self.iterator is None:
-            self.iterator=self.dataloader.__iter__()
-
-        try:
-            x = next(self.iterator)
-        except StopIteration:
-            self.iterator=self.dataloader.__iter__()
-            x = next(self.iterator)
-
-        return x
-
-    def step(self, lang1, lang2):
+    def step(self, lang1, lang2, batch):
         params = self.params
         self.encoder.train()
         self.decoder.train()
 
         lang1_id = params.lang2id[lang1]
         lang2_id = params.lang2id[lang2]
+        
+        inputs, ilen, target, tlen = batch
 
-        # generate batch
-        (x1, len1), (x2, len2) = self.get_batch()
-        langs1 = x1.clone().fill_(lang1_id)
-        langs2 = x2.clone().fill_(lang2_id)
-
+        inputs = pad_sequence(inputs, padding_value=2)  # (slen, n_paragraphs, bs)
+        ilen=torch.stack(ilen)  # (n_paragraphs, bs)
+        ilen=ilen.t()  # (bs, n_paragraphs)
+        inputs=inputs.permute(2, 1, 0)  # (bs, n_paragraphs, slen)
+        # if (ilen == 0).any():
+        #     print("ilen:")
+        #     print(ilen)
+        
         # target words to predict
-        alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
-        pred_mask = alen[:, None] < len2[None] - 1  # do not predict anything given the last target word
-        y = x2[1:].masked_select(pred_mask[:-1])
-        assert len(y) == (len2 - 1).sum().item()
+        # 這段不是那麼直觀
+        # y就是把target[1:]中的答案收集起來罷了
+        alen = torch.arange(tlen.max(), dtype=torch.long, device=tlen.device)
+        pred_mask = alen[:, None] < tlen[None] - 1  # do not predict anything given the last target word
+        y = target[1:].masked_select(pred_mask[:-1])
+        assert len(y) == (tlen - 1).sum().item()
+
+        target=target.t()  # (bs, slen)
+        pred_mask=pred_mask.t()  # (bs, slen)
+
+        langs1 = inputs.clone().fill_(lang1_id)
+        langs2 = target.clone().fill_(lang2_id)
 
         # cuda
-        x1, len1, langs1 = [t.cuda(0) for t in [x1, len1, langs1]]
+        inputs, ilen, langs1 = [t.cuda(0) for t in [inputs, ilen, langs1]]
 
         # encode source sentence
-        enc1 = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
-        enc1 = enc1.transpose(0, 1)
-
-        enc1, len1, x2, len2, langs2, pred_mask, y=[t.cuda(1) for t in [enc1, len1, x2, len2, langs2, pred_mask, y]]
-
+        loc_transf_outputs = self.encoder('fwd', x=inputs, lengths=ilen, langs=langs1, causal=False)    # (bs, n_paragraphs, slen, dim)
+        # loc_transf_outputs = loc_transf_outputs.transpose(0, 1)
+        
+        target, tlen, langs2, pred_mask, y=[t.cuda() for t in [target, tlen, langs2, pred_mask, y]]
+        if (tlen == 0).any():
+            print("tlen:")
+            print(tlen)
+        
         # decode target sentence
-        dec2 = self.decoder('fwd', x=x2, lengths=len2, langs=langs2, causal=True, src_enc=enc1, src_len=len1)
+        dec_out = self.decoder('fwd', x=target, lengths=tlen, langs=langs2, causal=True, src_enc=loc_transf_outputs, src_len=ilen)  # (bs, tlen, dim)
 
         # loss
-        _, loss = self.decoder('predict', tensor=dec2, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('Wikisum-%s-%s' % (lang1, lang2))].append(loss.item())
+        _, loss = self.decoder('predict', tensor=dec_out, pred_mask=pred_mask, y=y, get_scores=False)
+        self.stats[('WS-%s-%s' % (lang1, lang2))].append(loss.item())
 
         # optimize
         self.optimize(loss)
-
-        # number of processed sentences / words
-        self.n_sentences += params.batch_size
-        self.stats['processed_s'] += len2.size(0)
-        self.stats['processed_w'] += (len2 - 1).sum().item()
