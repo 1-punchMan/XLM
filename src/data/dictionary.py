@@ -24,6 +24,7 @@ SPECIAL_WORDS = 10
 
 SEP_WORD = SPECIAL_WORD % 0
 MASK_WORD = SPECIAL_WORD % 1
+END_WORD = SPECIAL_WORD % 2
 
 class Dictionary(object):
 
@@ -36,6 +37,7 @@ class Dictionary(object):
         self.eos_index = word2id[EOS_WORD]
         self.pad_index = word2id[PAD_WORD]
         self.unk_index = word2id[UNK_WORD]
+        self.end_index = word2id[END_WORD]
         self.check_valid()
 
     def __len__(self):

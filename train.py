@@ -15,7 +15,7 @@ from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
 from src.model import check_model_params, build_model
 from src.model.memory import HashingMemory
 from src.trainer import SingleTrainer, EncDecTrainer, WikisumTrainer
-from src.evaluation.evaluator import SingleEvaluator, EncDecEvaluator
+from src.evaluation.evaluator import SingleEvaluator, EncDecEvaluator, WikisumEvaluator
 
 
 def get_parser():
@@ -214,6 +214,10 @@ def get_parser():
     parser.add_argument("--master_port", type=int, default=-1,
                         help="Master port (for multi-node SLURM jobs)")
 
+    # Wikisum
+    parser.add_argument("--n_paragraphs", type=int, default=5,
+                        help="# of reference paragraphs to use")
+
     return parser
 
 
@@ -235,26 +239,26 @@ def main(params):
     # build model
     if params.encoder_only:
         model = build_model(params, data['dico'])
-    # elif params.exp_name == "wikisum":
-    #     encoder, encoder2, decoder = build_model(params, data['dico'])
+    elif params.exp_name == "wikisum":
+        global_encoder, local_encoder, decoder = build_model(params, data['dico'])
     else:
         encoder, decoder = build_model(params, data['dico'])
 
     # build trainer, reload potential checkpoints / build evaluator
-    trainer = WikisumTrainer(encoder, decoder, data, params)
-    # evaluator = WikisumEvaluator(trainer, data, params)
-
-    # # evaluation
-    # if params.eval_only:
-    #     scores = evaluator.run_all_evals(trainer)
-    #     for k, v in scores.items():
-    #         logger.info("%s -> %.6f" % (k, v))
-    #     logger.info("__log__:%s" % json.dumps(scores))
-    #     exit()
+    trainer = WikisumTrainer(global_encoder, local_encoder, decoder, data, params)
+    evaluator = WikisumEvaluator(trainer, data, params, data_set="valid")
+    
+    # evaluation
+    if params.eval_only:
+        scores = evaluator.evaluate(trainer)
+        for k, v in scores.items():
+            logger.info("%s -> %.6f" % (k, v))
+        logger.info("__log__:%s" % json.dumps(scores))
+        exit()
 
     # set sampling probabilities for training
     set_sampling_probs(data, params)
-
+    
     # language model training
     for _ in range(params.max_epoch):
 
@@ -262,30 +266,30 @@ def main(params):
 
         trainer.n_sentences = 0
 
-        for batch in trainer.dataloader:
+        for i, batch in enumerate(trainer.dataloader):
             for lang1, lang2 in shuf_order(params.ws_steps, params):
                 trainer.step(lang1, lang2, batch)
 
             trainer.iter()
-            # break
+            if i > 1000:
+                break 
+        
+        logger.info("============ End of epoch %i ============" % trainer.epoch)
+
+        # evaluate perplexity
+        scores = evaluator.evaluate(trainer)
+
+        # print / JSON log
+        for k, v in scores.items():
+            logger.info("%s -> %.6f" % (k, v))
+        if params.is_master:
+            logger.info("__log__:%s" % json.dumps(scores))
+
+        # end of epoch
+        trainer.save_best_model(scores)
+        trainer.save_periodic()
+        trainer.end_epoch(scores)
         break
-        # logger.info("============ End of epoch %i ============" % trainer.epoch)
-
-        # # evaluate perplexity
-        # scores = evaluator.run_all_evals(trainer)
-
-        # # print / JSON log
-        # for k, v in scores.items():
-        #     logger.info("%s -> %.6f" % (k, v))
-        # if params.is_master:
-        #     logger.info("__log__:%s" % json.dumps(scores))
-
-        # # end of epoch
-        # trainer.save_best_model(scores)
-        # trainer.save_periodic()
-        # trainer.end_epoch(scores)
-
-
 if __name__ == '__main__':
 
     # generate parser / parse parameters

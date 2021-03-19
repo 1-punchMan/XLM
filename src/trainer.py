@@ -253,10 +253,10 @@ class Trainer(object):
         """
         Print statistics about the training.
         """
-        if self.n_total_iter % 5 != 0:
+        if self.n_iter % 5 != 0:
             return
 
-        s_iter = "%7i - " % self.n_total_iter
+        s_iter = "%7i/%7i - " % (self.n_iter, self.epoch_size)
         s_stat = ' || '.join([
             '{}: {:7.4f}'.format(k, np.mean(v)) for k, v in self.stats.items()
             if type(v) is list and len(v) > 0
@@ -613,6 +613,7 @@ class Trainer(object):
                 if self.params.multi_gpu and 'SLURM_JOB_ID' in os.environ:
                     os.system('scancel ' + os.environ['SLURM_JOB_ID'])
                 exit()
+            self.n_iter=0
         self.save_checkpoint('checkpoint', include_optimizers=True)
         self.epoch += 1
 
@@ -947,6 +948,11 @@ def collate(samples, padding_value):
         seq=[torch.LongTensor(sent) for sent in inp]
         seq = pad_sequence(seq, padding_value=padding_value)
         inputs.append(seq)
+
+    inputs = pad_sequence(inputs, padding_value=2)  # (slen, n_paragraphs, bs)
+    ilen=torch.stack(ilen)  # (n_paragraphs, bs)
+    ilen=ilen.t()  # (bs, n_paragraphs)
+    inputs=inputs.permute(2, 1, 0)  # (bs, n_paragraphs, slen)
     
     target = [s[1] for s in samples]
     lens=[len(targ) for targ in target]
@@ -956,25 +962,35 @@ def collate(samples, padding_value):
     target = pad_sequence(target, padding_value=padding_value)
 
     return inputs, ilen, target, tlen
-    # inputs和target的size：(slen, bs)
+    # inputs size: (bs, n_paragraphs, slen)
+    # ilen size: (bs, n_paragraphs)
+    # target size: (slen, bs)
+    # tlen size: (bs)
 
-class WikisumTrainer(EncDecTrainer):
-    def __init__(self, encoder, decoder, data, params):
+class WikisumTrainer(Trainer):
+    def __init__(self, global_encoder, local_encoder, decoder, data, params):
+        self.MODEL_NAMES = ['global_encoder', 'local_encoder', 'decoder']
         pad_index=data["dico"].pad_index
-
         self.dataloader=DataLoader(
             data["datasets"]["training"],
             batch_size=params.batch_size,
             shuffle=True,
             drop_last=True,
             collate_fn=lambda samples: collate(samples, pad_index))
-        self.iterator=None
+        params.epoch_size=len(self.dataloader)
 
-        super().__init__(encoder, decoder, data, params)
+        self.global_encoder=global_encoder
+        self.local_encoder=local_encoder
+        self.decoder = decoder
+        self.data = data
+        self.params = params
+
+        super().__init__(data, params)
 
     def step(self, lang1, lang2, batch):
         params = self.params
-        self.encoder.train()
+        self.global_encoder.train()
+        self.local_encoder.train()
         self.decoder.train()
 
         lang1_id = params.lang2id[lang1]
@@ -982,14 +998,13 @@ class WikisumTrainer(EncDecTrainer):
         
         inputs, ilen, target, tlen = batch
 
-        inputs = pad_sequence(inputs, padding_value=2)  # (slen, n_paragraphs, bs)
-        ilen=torch.stack(ilen)  # (n_paragraphs, bs)
-        ilen=ilen.t()  # (bs, n_paragraphs)
-        inputs=inputs.permute(2, 1, 0)  # (bs, n_paragraphs, slen)
-        # if (ilen == 0).any():
-        #     print("ilen:")
-        #     print(ilen)
-        
+        # print("input:")
+        # for para in inputs[0].tolist():
+        #     print(' '.join([self.data["dico"][id] for id in para]))
+
+        # print("target:")
+        # print(' '.join([self.data["dico"][id] for id in target[:, 0].tolist()]))
+
         # target words to predict
         # 這段不是那麼直觀
         # y就是把target[1:]中的答案收集起來罷了
@@ -998,30 +1013,26 @@ class WikisumTrainer(EncDecTrainer):
         y = target[1:].masked_select(pred_mask[:-1])
         assert len(y) == (tlen - 1).sum().item()
 
-        target=target.t()  # (bs, slen)
-        pred_mask=pred_mask.t()  # (bs, slen)
+        target=target.t()
 
         langs1 = inputs.clone().fill_(lang1_id)
         langs2 = target.clone().fill_(lang2_id)
 
         # cuda
-        inputs, ilen, langs1 = [t.cuda(0) for t in [inputs, ilen, langs1]]
+        inputs, ilen, langs1 = [t.cuda() for t in [inputs, ilen, langs1]]
 
         # encode source sentence
-        loc_transf_outputs = self.encoder('fwd', x=inputs, lengths=ilen, langs=langs1, causal=False)    # (bs, n_paragraphs, slen, dim)
-        # loc_transf_outputs = loc_transf_outputs.transpose(0, 1)
+        local_enc_out = self.local_encoder('fwd', x=inputs, lengths=ilen, langs=langs1, causal=False)    # (bs, n_paragraphs, slen, dim)
+        global_enc_out=self.global_encoder(local_enc_out, lengths=ilen)    # (bs, n_paragraphs, slen, dim)
         
         target, tlen, langs2, pred_mask, y=[t.cuda() for t in [target, tlen, langs2, pred_mask, y]]
-        if (tlen == 0).any():
-            print("tlen:")
-            print(tlen)
         
         # decode target sentence
-        dec_out = self.decoder('fwd', x=target, lengths=tlen, langs=langs2, causal=True, src_enc=loc_transf_outputs, src_len=ilen)  # (bs, tlen, dim)
+        dec_out = self.decoder('fwd', x=target, lengths=tlen, langs=langs2, causal=True, src_enc=global_enc_out, src_len=ilen)  # (bs, tlen, dim)
 
         # loss
-        _, loss = self.decoder('predict', tensor=dec_out, pred_mask=pred_mask, y=y, get_scores=False)
+        _, loss = self.decoder('predict', tensor=dec_out.transpose(0, 1), pred_mask=pred_mask, y=y, get_scores=False)
         self.stats[('WS-%s-%s' % (lang1, lang2))].append(loss.item())
-
+        
         # optimize
         self.optimize(loss)

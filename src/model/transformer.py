@@ -78,28 +78,6 @@ def gelu(x):
     # return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
     return 0.5 * x * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
-
-# def get_masks(slen, lengths, causal):
-#     """
-#     Generate hidden states mask, and optionally an attention mask.
-#     """
-#     assert lengths.max().item() <= slen
-#     bs = lengths.size(0)
-#     alen = torch.arange(slen, dtype=torch.long, device=lengths.device)
-#     mask = alen < lengths[:, None]
-
-#     # attention mask is the same as mask, or triangular inferior attention (causal)
-#     if causal:
-#         attn_mask = alen[None, None, :].repeat(bs, slen, 1) <= alen[None, :, None]
-#     else:
-#         attn_mask = mask
-
-#     # sanity check
-#     assert mask.size() == (bs, slen)
-#     assert causal is False or attn_mask.size() == (bs, slen, slen)
-
-#     return mask, attn_mask
-
 def get_masks(slen, lengths, causal, is_decoder):
     """
     Generate hidden states mask, and optionally an attention mask.
@@ -190,16 +168,7 @@ class MultiHeadAttention(nn.Module):
         self.out_lin = Linear(dim, dim)
         self.is_decoder=is_decoder
 
-    def forward(self, input, mask, kv=None, cache=None):
-        if (input != input).any():
-            print("Gotcha!")
-            print("MultiHeadAttention:")
-            print("decoder:")
-            print("causal:" if kv is None else "attend enc:")
-            print("input:")
-            print(input)
-            exit()
-
+    def forward(self, input, mask, global_mask=None, kv=None, cache=None):
         if self.is_decoder:
             """
             Self-attention (if kv is None) or attention over source sentence (provided by kv).
@@ -218,7 +187,7 @@ class MultiHeadAttention(nn.Module):
 
             def shape(x):
                 """  projection """
-                return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
+                return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2).contiguous()
 
             def unshape(x):
                 """  compute context """
@@ -242,22 +211,6 @@ class MultiHeadAttention(nn.Module):
                     else:
                         k, v = cache[self.layer_id]
                 cache[self.layer_id] = (k, v)
-            if (q != q).any():
-                print("Gotcha!")
-                print("MultiHeadAttention:")
-                print("decoder:")
-                print("causal:" if kv is None else "attend enc:")
-                print("q:")
-                print(q)
-                exit()
-            if (k != k).any():
-                print("Gotcha!")
-                print("MultiHeadAttention:")
-                print("decoder:")
-                print("causal:" if kv is None else "attend enc:")
-                print("k:")
-                print(k)
-                exit()
 
             q = q / math.sqrt(dim_per_head)                                       # (bs, n_heads, qlen, dim_per_head)
             scores = torch.matmul(q, k.transpose(2, 3))                           # (bs, n_heads, qlen, klen)
@@ -267,34 +220,15 @@ class MultiHeadAttention(nn.Module):
 
             weights = F.softmax(scores.float(), dim=-1).type_as(scores)           # (bs, n_heads, qlen, klen)
             weights = F.dropout(weights, p=self.dropout, training=self.training)  # (bs, n_heads, qlen, klen)
-            # if (weights != weights).any():
-            #     print("Gotcha!")
-            #     print("MultiHeadAttention:")
-            #     print("decoder:")
-            #     print("causal:" if kv is None else "attend enc:")
-            #     print("weights:")
-            #     print(scores)
-            #     print(weights)
-            #     exit()
-            weights[torch.isnan(weights)]=0
             context = torch.matmul(weights, v)                                    # (bs, n_heads, qlen, dim_per_head)
             context = unshape(context)                                            # (bs, qlen, dim)
-            if (context != context).any():
-                print("Gotcha!")
-                print("MultiHeadAttention:")
-                print("decoder:")
-                print("causal:" if kv is None else "attend enc:")
-                print("context:")
-                print(context)
-                exit()
 
             return self.out_lin(context)
         else:
-            """
-            Self-attention (if kv is None) or attention over source sentence (provided by kv).
-            """
-            # Input is (bs, qlen, dim)
-            # Mask is (bs, klen) (non-causal) or (bs, klen, klen)
+            """ Self-attention """
+            # Input is (bs, n_paragraphs, qlen, dim)
+            # Mask is (bs, n_paragraphs, klen)
+            # global_mask is (bs, n_paragraphs)
             bs, n_paragraphs, qlen, dim = input.size()
             if kv is None:
                 klen = qlen if cache is None else cache['slen'] + qlen
@@ -303,7 +237,7 @@ class MultiHeadAttention(nn.Module):
             assert dim == self.dim, 'Dimensions do not match: %s input vs %s configured' % (dim, self.dim)
             n_heads = self.n_heads
             dim_per_head = dim // n_heads
-            mask_reshape = (bs, n_paragraphs, 1, qlen, klen) if mask.dim() == input.dim() else (bs, n_paragraphs, 1, 1, klen)
+            mask_reshape = (bs, n_paragraphs, 1, 1, klen)
 
             def shape(x):
                 """  projection """
@@ -331,30 +265,16 @@ class MultiHeadAttention(nn.Module):
                     else:
                         k, v = cache[self.layer_id]
                 cache[self.layer_id] = (k, v)
-            if (q != q).any():
-                print("Gotcha!")
-                print("MultiHeadAttention:")
-                print("encoder:")
-                print("q:")
-                print(q)
-                exit()
 
             q = q / math.sqrt(dim_per_head)                                       # (bs, n_heads, qlen, dim_per_head)
             scores = torch.matmul(q, k.transpose(3, 4))                           # (bs, n_heads, qlen, klen)
+            mask=torch.where(global_mask.unsqueeze(-1).expand_as(mask) == 0, True, mask)  # 為避免softmax把空句子填滿nan，所以空句子不做mask。
+            assert not (mask.sum(dim=-1) == 0).any()
             mask = (mask == 0).view(mask_reshape).expand_as(scores)               # (bs, n_heads, qlen, klen)
             scores.masked_fill_(mask, -float('inf'))                              # (bs, n_heads, qlen, klen)
 
             weights = F.softmax(scores.float(), dim=-1).type_as(scores)           # (bs, n_heads, qlen, klen)
             weights = F.dropout(weights, p=self.dropout, training=self.training)  # (bs, n_heads, qlen, klen)
-            # if (weights != weights).any():
-            #     print("Gotcha!")
-            #     print("MultiHeadAttention:")
-            #     print("encoder:")
-            #     print("weights:")
-            #     print(scores)
-            #     print(weights)
-            #     exit()
-            weights[torch.isnan(weights)]=0
             context = torch.matmul(weights, v)                                    # (bs, n_heads, qlen, dim_per_head)
             context = unshape(context)                                            # (bs, qlen, dim)
 
@@ -369,66 +289,69 @@ class Global_MultiHeadAttention(nn.Module):
         self.layer_id = next(MultiHeadAttention.NEW_ID)
         self.dim = dim
         self.n_heads = n_heads
+        self.dim_per_head=self.dim // self.n_heads
+        dim_per_head = self.dim_per_head
         self.dropout = dropout
         assert self.dim % self.n_heads == 0
 
-        self.q_lin = Linear(dim, dim)
-        self.k_lin = Linear(dim, dim)
-        self.v_lin = Linear(dim, dim)
+        self.pw_lin = Linear(dim, n_heads)
+        self.pv_lin = Linear(dim, dim)
+        self.lin = Linear(dim, dim)
+        self.layer_norm = nn.LayerNorm(self.dim, eps=1e-12)
+        self.q_lin = Linear(dim_per_head, dim_per_head)
+        self.k_lin = Linear(dim_per_head, dim_per_head)
+        self.v_lin = Linear(dim_per_head, dim_per_head)
         self.out_lin = Linear(dim, dim)
 
-    def forward(self, input, mask, kv=None, cache=None):
-        """
-        Self-attention (if kv is None) or attention over source sentence (provided by kv).
-        """
-        # Input is (bs, qlen, dim)
-        # Mask is (bs, klen) (non-causal) or (bs, klen, klen)
-        bs, qlen, dim = input.size()
-        if kv is None:
-            klen = qlen if cache is None else cache['slen'] + qlen
-        else:
-            klen = kv.size(1)
+    def forward(self, input, mask, global_mask):
+        # Input is (bs, n_paragraphs, slen, dim)
+        # Mask is (bs, n_paragraphs, slen)
+        # global_mask is (bs, n_paragraphs)
+        bs, n_paragraphs, slen, dim = input.size()
         assert dim == self.dim, 'Dimensions do not match: %s input vs %s configured' % (dim, self.dim)
         n_heads = self.n_heads
-        dim_per_head = dim // n_heads
-        mask_reshape = (bs, 1, qlen, klen) if mask.dim() == 3 else (bs, 1, 1, klen)
+        dim_per_head = self.dim_per_head
 
         def shape(x):
             """  projection """
-            return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
+            return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2).contiguous()
 
         def unshape(x):
             """  compute context """
             return x.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * dim_per_head)
 
-        q = shape(self.q_lin(input))                                          # (bs, n_heads, qlen, dim_per_head)
-        if kv is None:
-            k = shape(self.k_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
-            v = shape(self.v_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
-        elif cache is None or self.layer_id not in cache:
-            k = v = kv
-            k = shape(self.k_lin(k))                                          # (bs, n_heads, qlen, dim_per_head)
-            v = shape(self.v_lin(v))                                          # (bs, n_heads, qlen, dim_per_head)
+        # multi-head weighted pooling
+        pw = self.pw_lin(input)                                      # (bs, n_paragraphs, slen, n_heads)
+        pv = self.pv_lin(input) # (bs, n_paragraphs, slen, dim)
+        pv=pv.reshape(bs, n_paragraphs, slen, n_heads, dim_per_head).transpose(2, 3).contiguous()                                      # (bs, n_paragraphs, n_heads, slen, dim_per_head)
 
-        if cache is not None:
-            if self.layer_id in cache:
-                if kv is None:
-                    k_, v_ = cache[self.layer_id]
-                    k = torch.cat([k_, k], dim=2)                             # (bs, n_heads, klen, dim_per_head)
-                    v = torch.cat([v_, v], dim=2)                             # (bs, n_heads, klen, dim_per_head)
-                else:
-                    k, v = cache[self.layer_id]
-            cache[self.layer_id] = (k, v)
-
+        mask=torch.where(global_mask.unsqueeze(-1).expand_as(mask) == 0, True, mask)  # 為避免softmax把空句子填滿nan，所以空句子不做mask。
+        assert not (mask.sum(dim=-1) == 0).any()
+        mask = (mask == 0).unsqueeze(-1).expand_as(pw)               # (bs, n_paragraphs, slen, n_heads)
+        pw.masked_fill_(mask, -float('inf'))                              # (bs, n_paragraphs, slen, n_heads)
+        
+        weights = F.softmax(pw.float(), dim=2).type_as(pw)           # (bs, n_paragraphs, slen, n_heads)
+        # weights=torch.where(torch.isnan(weights), torch.zeros_like(weights), weights)
+        weights = F.dropout(weights, p=self.dropout, training=self.training)  # (bs, n_paragraphs, slen, n_heads)
+        weights = weights.transpose(2, 3).contiguous().unsqueeze(dim=3)  # (bs, n_paragraphs, n_heads, 1, slen)
+        context = torch.matmul(weights, pv)                                    # (bs, n_paragraphs, n_heads, 1, dim_per_head)
+        context = context.reshape(bs, n_paragraphs, dim)                                    # (bs, n_paragraphs, dim)
+        context = self.layer_norm(self.lin(context)) # (bs, n_paragraphs, dim)
+        
+        # global attention
+        q = self.q_lin(shape(context))                                          # (bs, n_heads, n_paragraphs, dim_per_head)
+        k = self.k_lin(shape(context))                                      # (bs, n_heads, n_paragraphs, dim_per_head)
+        v = self.v_lin(shape(context))                                      # (bs, n_heads, n_paragraphs, dim_per_head)
+        
         q = q / math.sqrt(dim_per_head)                                       # (bs, n_heads, qlen, dim_per_head)
-        scores = torch.matmul(q, k.transpose(2, 3))                           # (bs, n_heads, qlen, klen)
-        mask = (mask == 0).view(mask_reshape).expand_as(scores)               # (bs, n_heads, qlen, klen)
-        scores.masked_fill_(mask, -float('inf'))                              # (bs, n_heads, qlen, klen)
-
-        weights = F.softmax(scores.float(), dim=-1).type_as(scores)           # (bs, n_heads, qlen, klen)
-        weights = F.dropout(weights, p=self.dropout, training=self.training)  # (bs, n_heads, qlen, klen)
-        context = torch.matmul(weights, v)                                    # (bs, n_heads, qlen, dim_per_head)
-        context = unshape(context)                                            # (bs, qlen, dim)
+        scores = torch.matmul(q, k.transpose(2, 3))                           # (bs, n_heads, n_paragraphs, n_paragraphs)
+        global_mask = (global_mask == 0).reshape(bs, 1, 1, n_paragraphs).expand_as(scores)               # (bs, n_heads, n_paragraphs, n_paragraphs)
+        scores.masked_fill_(global_mask, -float('inf'))                              # (bs, n_heads, n_paragraphs, n_paragraphs)
+        
+        weights = F.softmax(scores.float(), dim=-1).type_as(scores)           # (bs, n_heads, n_paragraphs, n_paragraphs)
+        weights = F.dropout(weights, p=self.dropout, training=self.training)  # (bs, n_heads, n_paragraphs, n_paragraphs)
+        context = torch.matmul(weights, v)                                    # (bs, n_heads, n_paragraphs, dim_per_head)
+        context = unshape(context)                                            # (bs, n_paragraphs, dim)
 
         return self.out_lin(context)
 
@@ -443,21 +366,7 @@ class TransformerFFN(nn.Module):
 
     def forward(self, input):
         x = self.lin1(input)
-        if (x != x).any():
-            print("Gotcha!")
-            print("TransformerFFN:")
-            print("lin1:")
-            print("x:")
-            print(x)
-            exit()
         x = self.act(x)
-        if (x != x).any():
-            print("Gotcha!")
-            print("TransformerFFN:")
-            print("act:")
-            print("x:")
-            print(x)
-            exit()
         x = self.lin2(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         return x
@@ -484,6 +393,7 @@ class TransformerModel(nn.Module):
         self.eos_index = params.eos_index
         self.pad_index = params.pad_index
         self.dico = dico
+        self.end_index=dico.end_index
         self.id2lang = params.id2lang
         self.lang2id = params.lang2id
         self.use_lang_emb = getattr(params, 'use_lang_emb', True)
@@ -556,104 +466,6 @@ class TransformerModel(nn.Module):
         else:
             raise Exception("Unknown mode: %s" % mode)
 
-    # def fwd(self, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None):
-    #     """
-    #     Inputs:
-    #         `x` LongTensor(slen, bs), containing word indices
-    #         `lengths` LongTensor(bs), containing the length of each sentence
-    #         `causal` Boolean, if True, the attention is only done over previous hidden states
-    #         `positions` LongTensor(slen, bs), containing word positions
-    #         `langs` LongTensor(slen, bs), containing language IDs
-    #     """
-    #     # lengths = (x != self.pad_index).float().sum(dim=1)
-    #     # mask = x != self.pad_index
-
-    #     # check inputs
-    #     slen, bs = x.size()
-    #     assert lengths.size(0) == bs
-    #     assert lengths.max().item() <= slen
-    #     x = x.transpose(0, 1)  # batch size as dimension 0
-    #     assert (src_enc is None) == (src_len is None)
-    #     if src_enc is not None:
-    #         assert self.is_decoder
-    #         assert src_enc.size(0) == bs
-
-    #     # generate masks
-    #     mask, attn_mask = get_masks(slen, lengths, causal)
-    #     if self.is_decoder and src_enc is not None:
-    #         src_mask = torch.arange(src_len.max(), dtype=torch.long, device=lengths.device) < src_len[:, None]
-
-    #     # positions
-    #     if positions is None:
-    #         positions = x.new(slen).long()
-    #         positions = torch.arange(slen, out=positions).unsqueeze(0)
-    #     else:
-    #         assert positions.size() == (slen, bs)
-    #         positions = positions.transpose(0, 1)
-
-    #     # langs
-    #     if langs is not None:
-    #         assert langs.size() == (slen, bs)
-    #         langs = langs.transpose(0, 1)
-
-    #     # do not recompute cached elements
-    #     if cache is not None:
-    #         _slen = slen - cache['slen']
-    #         x = x[:, -_slen:]
-    #         positions = positions[:, -_slen:]
-    #         if langs is not None:
-    #             langs = langs[:, -_slen:]
-    #         mask = mask[:, -_slen:]
-    #         attn_mask = attn_mask[:, -_slen:]
-
-    #     # embeddings
-    #     tensor = self.embeddings(x)
-    #     tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
-    #     if langs is not None and self.use_lang_emb:
-    #         tensor = tensor + self.lang_embeddings(langs)
-    #     tensor = self.layer_norm_emb(tensor)
-    #     tensor = F.dropout(tensor, p=self.dropout, training=self.training)
-    #     tensor *= mask.unsqueeze(-1).to(tensor.dtype)
-
-    #     # transformer layers
-    #     for i in range(self.n_layers):
-
-    #         # self attention
-    #         attn = self.attentions[i](tensor, attn_mask, cache=cache)
-    #         attn = F.dropout(attn, p=self.dropout, training=self.training)
-    #         tensor = tensor + attn
-    #         tensor = self.layer_norm1[i](tensor)
-
-    #         # encoder attention (for decoder only)
-    #         if self.is_decoder and src_enc is not None:
-    #             attn = self.encoder_attn[i](tensor, src_mask, kv=src_enc, cache=cache)
-    #             attn = F.dropout(attn, p=self.dropout, training=self.training)
-    #             tensor = tensor + attn
-    #             tensor = self.layer_norm15[i](tensor)
-
-    #         # FFN
-    #         if ('%i_in' % i) in self.memories:
-    #             tensor = tensor + self.memories['%i_in' % i](tensor)
-    #         else:
-    #             tensor = tensor + self.ffns[i](tensor)
-    #         tensor = self.layer_norm2[i](tensor)
-
-    #         # memory
-    #         if ('%i_after' % i) in self.memories:
-    #             tensor = tensor + self.memories['%i_after' % i](tensor)
-    #         # TODO: add extra layer norm here?
-
-    #         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
-
-    #     # update cache length
-    #     if cache is not None:
-    #         cache['slen'] += tensor.size(1)
-
-    #     # move back sequence length to dimension 0
-    #     tensor = tensor.transpose(0, 1)
-
-    #     return tensor
-
     def fwd(self, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None):
         """
         Inputs:
@@ -681,22 +493,18 @@ class TransformerModel(nn.Module):
 
         # generate masks
         mask, attn_mask = get_masks(slen, lengths, causal, is_decoder=self.is_decoder)
+        global_mask=lengths != 0
         if self.is_decoder and src_enc is not None:
             src_mask = torch.arange(src_len.max(), dtype=torch.long, device=src_len.device) < src_len.unsqueeze(-1) # (bs, n_paragraphs, src_len.max())
-            # if (src_len == 0).any():
-            #     DEBUG=True
-            #     print("src_len:")
-            #     print(src_len)
-            #     print(src_enc.size())
-            #     print(src_mask)
+            src_enc, src_mask=src_enc.reshape(bs, -1, self.dim), src_mask.reshape(bs, -1)
                 
         # positions
         if positions is None:
             positions = x.new(slen).long()
             positions = torch.arange(slen, out=positions).unsqueeze(0)
         else:
-            assert positions.size() == (slen, bs)
-            positions = positions.transpose(0, 1)
+            assert positions.size() == (bs, slen)
+            # positions = positions.transpose(0, 1)
 
         # langs
         if langs is not None:
@@ -732,10 +540,10 @@ class TransformerModel(nn.Module):
                 print("transformer layers:", i)
                 print("decoder:" if self.is_decoder else "encoder:")
                 print(tensor)
-                exit()
+                # exit()
 
             # self attention
-            attn = self.attentions[i](tensor, attn_mask, cache=cache)
+            attn = self.attentions[i](tensor, attn_mask, global_mask, cache=cache)
             attn = F.dropout(attn, p=self.dropout, training=self.training)
             tensor = tensor + attn
             tensor = self.layer_norm1[i](tensor)
@@ -745,11 +553,10 @@ class TransformerModel(nn.Module):
                 print("self attention")
                 print("decoder:" if self.is_decoder else "encoder:")
                 print(tensor)
-                exit()
+                # exit()
 
             # encoder attention (for decoder only)
             if self.is_decoder and src_enc is not None:
-                src_enc, src_mask=src_enc.reshape(bs, -1, self.dim), src_mask.reshape(bs, -1)
                 attn = self.encoder_attn[i](tensor, src_mask, kv=src_enc, cache=cache)
                 attn = F.dropout(attn, p=self.dropout, training=self.training)
                 tensor = tensor + attn
@@ -767,7 +574,7 @@ class TransformerModel(nn.Module):
                 print("decoder:" if self.is_decoder else "encoder:")
                 print("tensor:")
                 print(tensor)
-                exit()
+                # exit()
             tensor = self.layer_norm2[i](tensor)
 
             # memory
@@ -789,9 +596,10 @@ class TransformerModel(nn.Module):
     def predict(self, tensor, pred_mask, y, get_scores):
         """
         Given the last hidden state, compute word scores and/or the loss.
+            `tensor` size: (slen, bs, dim)
             `pred_mask` is a ByteTensor of shape (slen, bs), filled with 1 when
                 we need to predict a word
-            `y` is a LongTensor of shape (pred_mask.sum(),)
+            `y` is a LongTensor of shape (pred_mask.sum(),)(順序是(slen*bs))
             `get_scores` is a boolean specifying whether we need to return scores
         """
         masked_tensor = tensor[pred_mask.unsqueeze(-1).expand_as(tensor)].view(-1, self.dim)
@@ -913,7 +721,7 @@ class TransformerModel(nn.Module):
 
         # expand to beam size the source latent representations / source lengths
         src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view((bs * beam_size,) + src_enc.shape[1:])
-        src_len = src_len.unsqueeze(1).expand(bs, beam_size).contiguous().view(-1)
+        src_len = src_len.unsqueeze(1).expand((bs, beam_size) + src_len.shape[1:]).contiguous().view((bs * beam_size,) + src_len.shape[1:])
 
         # generated sentences (batch with beam current hypotheses)
         generated = src_len.new(max_len, bs * beam_size)  # upcoming output
@@ -945,19 +753,19 @@ class TransformerModel(nn.Module):
         done = [False for _ in range(bs)]
 
         while cur_len < max_len:
-
+            
             # compute word scores
             tensor = self.forward(
                 'fwd',
-                x=generated[:cur_len],
+                x=generated[:cur_len].t(),
                 lengths=src_len.new(bs * beam_size).fill_(cur_len),
-                positions=positions[:cur_len],
-                langs=langs[:cur_len],
+                positions=positions[:cur_len].t(),
+                langs=langs[:cur_len].t(),
                 causal=True,
                 src_enc=src_enc,
                 src_len=src_len,
                 cache=cache
-            )
+            ).transpose(0, 1)   # (1, bs * beam_size, self.dim)
             assert tensor.size() == (1, bs * beam_size, self.dim)
             tensor = tensor.data[-1, :, :]               # (bs * beam_size, dim)
             scores = self.pred_layer.get_scores(tensor)  # (bs * beam_size, n_words)
@@ -993,9 +801,9 @@ class TransformerModel(nn.Module):
                     # get beam and word IDs
                     beam_id = idx // n_words
                     word_id = idx % n_words
-
+                    
                     # end of sentence, or next word
-                    if word_id == self.eos_index or cur_len + 1 == max_len:
+                    if word_id == self.end_index or cur_len + 1 == max_len:
                         generated_hyps[sent_id].add(generated[:cur_len, sent_id * beam_size + beam_id].clone(), value.item())
                     else:
                         next_sent_beam.append((value, word_id, sent_id * beam_size + beam_id))
@@ -1032,56 +840,41 @@ class TransformerModel(nn.Module):
                 break
 
         # visualize hypotheses
-        # print([len(x) for x in generated_hyps], cur_len)
-        # globals().update( locals() );
-        # !import code; code.interact(local=vars())
-        # for ii in range(bs):
-        #     for ss, ww in sorted(generated_hyps[ii].hyp, key=lambda x: x[0], reverse=True):
-        #         print("%.3f " % ss + " ".join(self.dico[x] for x in ww.tolist()))
-        #     print("")
+        print([len(x) for x in generated_hyps], cur_len)
+        globals().update( locals() )
+        #import code; code.interact(local=vars())
+        for ii in range(bs):
+            for ss, ww in sorted(generated_hyps[ii].hyp, key=lambda x: x[0], reverse=True):
+                print("%.3f " % ss + " ".join(self.dico[x] for x in ww.tolist()))
+            print("")
 
         # select the best hypotheses
         tgt_len = src_len.new(bs)
         best = []
-
+        print(generated_hyps[0].hyp)
         for i, hypotheses in enumerate(generated_hyps):
             best_hyp = max(hypotheses.hyp, key=lambda x: x[0])[1]
-            tgt_len[i] = len(best_hyp) + 1  # +1 for the <EOS> symbol
+            tgt_len[i] = len(best_hyp) + 1  # +1 for the <END> symbol
             best.append(best_hyp)
 
         # generate target batch
         decoded = src_len.new(tgt_len.max().item(), bs).fill_(self.pad_index)
         for i, hypo in enumerate(best):
             decoded[:tgt_len[i] - 1, i] = hypo
-            decoded[tgt_len[i] - 1, i] = self.eos_index
+            decoded[tgt_len[i] - 1, i] = self.end_index
 
         # sanity check
-        assert (decoded == self.eos_index).sum() == 2 * bs
+        assert (decoded == self.end_index).sum() == bs
 
         return decoded, tgt_len
 
 class Global_Transformer(nn.Module):
 
-    ATTRIBUTES = ['encoder', 'with_output', 'eos_index', 'pad_index', 'n_langs', 'n_words', 'dim', 'n_layers', 'n_heads', 'hidden_dim', 'dropout', 'attention_dropout', 'asm', 'asm_cutoffs', 'asm_div_value']
+    ATTRIBUTES = ['dim', 'n_layers', 'n_heads', 'hidden_dim', 'dropout', 'attention_dropout']
 
-    def __init__(self, params, dico, is_encoder, with_output):
+    def __init__(self, params):
         super().__init__()
-
-        # encoder / decoder, output layer
-        self.with_output = with_output
-
-        # dictionary / languages
-        self.n_langs = params.n_langs
-        self.n_words = params.n_words
-        self.eos_index = params.eos_index
-        self.pad_index = params.pad_index
-        self.dico = dico
-        self.id2lang = params.id2lang
-        self.lang2id = params.lang2id
-        self.use_lang_emb = getattr(params, 'use_lang_emb', True)
-        assert len(self.dico) == self.n_words
-        assert len(self.id2lang) == len(self.lang2id) == self.n_langs
-
+        
         # model parameters
         self.dim = params.emb_dim       # 512 by default
         self.hidden_dim = self.dim * 4  # 2048 by default
@@ -1096,145 +889,37 @@ class Global_Transformer(nn.Module):
         self.layer_norm1 = nn.ModuleList()
         self.ffns = nn.ModuleList()
         self.layer_norm2 = nn.ModuleList()
-        if self.is_decoder:
-            self.layer_norm15 = nn.ModuleList()
-            self.encoder_attn = nn.ModuleList()
-
-        # memories
-        self.memories = nn.ModuleDict()
-        if getattr(params, 'use_memory', False):
-            mem_positions = params.mem_enc_positions if is_encoder else params.mem_dec_positions
-            for layer_id, pos in mem_positions:
-                assert 0 <= layer_id <= params.n_layers - 1
-                assert pos in ['in', 'after']
-                self.memories['%i_%s' % (layer_id, pos)] = HashingMemory.build(self.dim, self.dim, params)
-
+        
         for layer_id in range(self.n_layers):
-            self.attentions.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
+            self.attentions.append(Global_MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
             self.layer_norm1.append(nn.LayerNorm(self.dim, eps=1e-12))
-            if self.is_decoder:
-                self.layer_norm15.append(nn.LayerNorm(self.dim, eps=1e-12))
-                self.encoder_attn.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
-            if ('%i_in' % layer_id) in self.memories:
-                self.ffns.append(None)
-            else:
-                self.ffns.append(TransformerFFN(self.dim, self.hidden_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
+            self.ffns.append(TransformerFFN(self.dim, self.hidden_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
             self.layer_norm2.append(nn.LayerNorm(self.dim, eps=1e-12))
 
-        # output layer
-        if self.with_output:
-            self.pred_layer = PredLayer(params)
-            if params.share_inout_emb:
-                self.pred_layer.proj.weight = self.embeddings.weight
-
-    def forward(self, mode, **kwargs):
-        """
-        Forward function with different forward modes.
-        ### Small hack to handle PyTorch distributed.
-        """
-        if mode == 'fwd':
-            return self.fwd(**kwargs)
-        elif mode == 'predict':
-            return self.predict(**kwargs)
-        else:
-            raise Exception("Unknown mode: %s" % mode)
-
-    def fwd(self, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None):
-        """
-        Inputs:
-            `x` LongTensor(slen, bs), containing word indices
-            `lengths` LongTensor(bs), containing the length of each sentence
-            `causal` Boolean, if True, the attention is only done over previous hidden states
-            `positions` LongTensor(slen, bs), containing word positions
-            `langs` LongTensor(slen, bs), containing language IDs
-        """
-        # lengths = (x != self.pad_index).float().sum(dim=1)
-        # mask = x != self.pad_index
-
-        # check inputs
-        slen, bs = x.size()
-        assert lengths.size(0) == bs
-        assert lengths.max().item() <= slen
-        x = x.transpose(0, 1)  # batch size as dimension 0
-        assert (src_enc is None) == (src_len is None)
-        if src_enc is not None:
-            assert self.is_decoder
-            assert src_enc.size(0) == bs
+    def forward(self, input, lengths):
+        # input的size：(bs, n_paragraphs, slen, dim)
+        
+        bs, n_paragraphs, slen, dim = input.size()
 
         # generate masks
-        mask, attn_mask = get_masks(slen, lengths, causal)
-        if self.is_decoder and src_enc is not None:
-            src_mask = torch.arange(src_len.max(), dtype=torch.long, device=lengths.device) < src_len[:, None]
-
-        # positions
-        if positions is None:
-            positions = x.new(slen).long()
-            positions = torch.arange(slen, out=positions).unsqueeze(0)
-        else:
-            assert positions.size() == (slen, bs)
-            positions = positions.transpose(0, 1)
-
-        # langs
-        if langs is not None:
-            assert langs.size() == (slen, bs)
-            langs = langs.transpose(0, 1)
-
-        # do not recompute cached elements
-        if cache is not None:
-            _slen = slen - cache['slen']
-            x = x[:, -_slen:]
-            positions = positions[:, -_slen:]
-            if langs is not None:
-                langs = langs[:, -_slen:]
-            mask = mask[:, -_slen:]
-            attn_mask = attn_mask[:, -_slen:]
-
-        # embeddings
-        tensor = self.embeddings(x)
-        tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
-        if langs is not None and self.use_lang_emb:
-            tensor = tensor + self.lang_embeddings(langs)
-        tensor = self.layer_norm_emb(tensor)
-        tensor = F.dropout(tensor, p=self.dropout, training=self.training)
-        tensor *= mask.unsqueeze(-1).to(tensor.dtype)
+        mask, attn_mask = get_masks(slen, lengths, causal=False, is_decoder=False)
+        global_mask=lengths != 0
 
         # transformer layers
         for i in range(self.n_layers):
 
             # self attention
-            attn = self.attentions[i](tensor, attn_mask, cache=cache)
-            attn = F.dropout(attn, p=self.dropout, training=self.training)
-            tensor = tensor + attn
+            attn = self.attentions[i](input, attn_mask, global_mask)
+            attn = F.dropout(attn, p=self.dropout, training=self.training)    # (bs, n_paragraphs, dim)
+            tensor = attn.contiguous().unsqueeze(dim=2) + input # 第2維會廣播
             tensor = self.layer_norm1[i](tensor)
 
-            # encoder attention (for decoder only)
-            if self.is_decoder and src_enc is not None:
-                attn = self.encoder_attn[i](tensor, src_mask, kv=src_enc, cache=cache)
-                attn = F.dropout(attn, p=self.dropout, training=self.training)
-                tensor = tensor + attn
-                tensor = self.layer_norm15[i](tensor)
-
             # FFN
-            if ('%i_in' % i) in self.memories:
-                tensor = tensor + self.memories['%i_in' % i](tensor)
-            else:
-                tensor = tensor + self.ffns[i](tensor)
+            tensor = tensor + self.ffns[i](tensor)
             tensor = self.layer_norm2[i](tensor)
 
-            # memory
-            if ('%i_after' % i) in self.memories:
-                tensor = tensor + self.memories['%i_after' % i](tensor)
-            # TODO: add extra layer norm here?
-
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
-
-        # update cache length
-        if cache is not None:
-            cache['slen'] += tensor.size(1)
-
-        # move back sequence length to dimension 0
-        tensor = tensor.transpose(0, 1)
-
+            
         return tensor
 
 class BeamHypotheses(object):

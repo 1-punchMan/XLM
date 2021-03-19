@@ -11,9 +11,11 @@ import subprocess
 from collections import OrderedDict
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from ..utils import to_cuda, restore_segmentation, concat_batches
 from ..model.memory import HashingMemory
+from ..trainer import collate
 
 
 BLEU_SCRIPT_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'multi-bleu.perl')
@@ -523,6 +525,179 @@ class EncDecEvaluator(Evaluator):
             logger.info("BLEU %s %s : %f" % (hyp_path, ref_path, bleu))
             scores['%s_%s-%s_mt_bleu' % (data_set, lang1, lang2)] = bleu
 
+class WikisumEvaluator(Evaluator):
+
+    def __init__(self, trainer, data, params, data_set):
+        """
+        Build encoder / decoder evaluator.
+        """
+        self.global_encoder=trainer.global_encoder
+        self.local_encoder=trainer.local_encoder
+        self.decoder = trainer.decoder
+        self.data_set=data_set
+        pad_index=data["dico"].pad_index
+        self.dataloader=DataLoader(
+                data["datasets"][data_set],
+                batch_size=params.batch_size,
+                collate_fn=lambda samples: collate(samples, pad_index))
+
+        super().__init__(trainer, data, params)
+
+    def evaluate_ws(self, scores, lang1, lang2):
+        """
+        Evaluate perplexity and next word prediction accuracy.
+        """
+        params = self.params
+        assert self.data_set in ['valid', 'test']
+        assert lang1 in params.langs
+        assert lang2 in params.langs
+
+        self.global_encoder.eval()
+        self.local_encoder.eval()
+        self.decoder.eval()
+        global_encoder = self.global_encoder.module if params.multi_gpu else self.global_encoder
+        local_encoder = self.local_encoder.module if params.multi_gpu else self.local_encoder
+        decoder = self.decoder.module if params.multi_gpu else self.decoder
+
+        lang1_id = params.lang2id[lang1]
+        lang2_id = params.lang2id[lang2]
+
+        n_words = 0
+        xe_loss = 0
+        n_valid = 0
+
+        # only save states / evaluate usage on the validation set
+        eval_memory = params.use_memory and self.data_set == 'valid' and self.params.is_master
+        HashingMemory.EVAL_MEMORY = eval_memory
+        if eval_memory:
+            all_mem_att = {k: [] for k, _ in self.memory_list}
+
+        hypothesis = []
+
+        for i, batch in enumerate(self.dataloader):
+            # generate batch
+            inputs, ilen, target, tlen = batch
+
+            print("input:")
+            for para in inputs[0].tolist():
+                print(' '.join([self.data["dico"][id] for id in para]))
+
+            # target words to predict
+            alen = torch.arange(tlen.max(), dtype=torch.long, device=tlen.device)
+            pred_mask = alen[:, None] < tlen[None] - 1  # do not predict anything given the last target word
+            y = target[1:].masked_select(pred_mask[:-1])
+            assert len(y) == (tlen - 1).sum().item()
+
+            target=target.t()  # (bs, slen)
+
+            langs1 = inputs.clone().fill_(lang1_id)
+            langs2 = target.clone().fill_(lang2_id)
+
+            # cuda
+            inputs, ilen, langs1 = [t.cuda() for t in [inputs, ilen, langs1]]
+
+            # encode source sentence
+            local_enc_out = local_encoder('fwd', x=inputs, lengths=ilen, langs=langs1, causal=False)    # (bs, n_paragraphs, slen, dim)
+            global_enc_out=global_encoder(local_enc_out, lengths=ilen)    # (bs, n_paragraphs, slen, dim)
+            global_enc_out = global_enc_out.half() if params.fp16 else global_enc_out
+
+            target, tlen, langs2, pred_mask, y=[t.cuda() for t in [target, tlen, langs2, pred_mask, y]]
+            
+            # decode target sentence
+            dec_out = decoder('fwd', x=target, lengths=tlen, langs=langs2, causal=True, src_enc=global_enc_out, src_len=ilen)  # (bs, tlen, dim)
+
+            # loss
+            word_scores, loss = decoder('predict', tensor=dec_out.transpose(0, 1), pred_mask=pred_mask, y=y, get_scores=True)
+            
+            # update stats
+            n_words += y.size(0)
+            xe_loss += loss.item() * len(y)
+            n_valid += (word_scores.max(1)[1] == y).sum().item()
+            if eval_memory:
+                for k, v in self.memory_list:
+                    all_mem_att[k].append((v.last_indices, v.last_scores))
+
+            # generate translation - translate / convert to text
+            if params.beam_size == 1:
+                generated, lengths = decoder.generate(global_enc_out, ilen, lang2_id, max_len=params.bptt)
+            else:
+                generated, lengths = decoder.generate_beam(
+                    global_enc_out, ilen, lang2_id, beam_size=params.beam_size,
+                    length_penalty=params.length_penalty,
+                    early_stopping=params.early_stopping,
+                    max_len=params.bptt
+                )
+            hypothesis.extend(convert_to_text(generated, lengths, self.dico, params))
+
+            if i % 5 == 0:
+                print(hypothesis[i*self.params.batch_size])
+        # compute perplexity and prediction accuracy
+        scores['%s_%s-%s_ws_ppl' % (self.data_set, lang1, lang2)] = np.exp(xe_loss / n_words)
+        scores['%s_%s-%s_ws_acc' % (self.data_set, lang1, lang2)] = 100. * n_valid / n_words
+
+        # compute memory usage
+        if eval_memory:
+            for mem_name, mem_att in all_mem_att.items():
+                eval_memory_usage(scores, '%s_%s-%s_%s' % (self.data_set, lang1, lang2, mem_name), mem_att, params.mem_size)
+
+        # compute ROUGE
+
+        # hypothesis / reference paths
+        hyp_name = 'hyp{0}.{1}-{2}.{3}.txt'.format(scores['epoch'], lang1, lang2, self.data_set)
+        hyp_path = os.path.join(params.hyp_path, hyp_name)
+        ref_path = params.ref_paths[(lang1, lang2, self.data_set)]
+
+        # export sentences to hypothesis file / restore BPE segmentation
+        with open(hyp_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(hypothesis) + '\n')
+        restore_segmentation(hyp_path)
+
+        # # evaluate BLEU score
+        # bleu = eval_moses_bleu(ref_path, hyp_path)
+        # logger.info("BLEU %s %s : %f" % (hyp_path, ref_path, bleu))
+        # scores['%s_%s-%s_mt_bleu' % (self.data_set, lang1, lang2)] = bleu
+
+    def evaluate(self, trainer):
+        params = self.params
+        scores = OrderedDict({'epoch': trainer.epoch})
+
+        with torch.no_grad():
+            # Wikisum (evaluate perplexity and accuracy)
+            for lang1, lang2 in params.ws_steps:
+                self.evaluate_ws(scores, lang1, lang2)
+
+        return scores
+
+    def create_reference_files(self):
+        """
+        Create reference files for ROUGE evaluation.
+        """
+        params = self.params
+        params.ref_paths = {}
+
+        for lang1, lang2 in params.ws_steps:
+            # define data paths
+            lang2_path = os.path.join(params.hyp_path, 'ref.{0}-{1}.{2}.txt'.format(lang1, lang2, self.data_set))
+
+            # store data paths
+            params.ref_paths[(lang1, lang2, self.data_set)] = lang2_path
+
+            # text sentences
+            lang2_txt = []
+
+            # convert to text
+            for inputs, ilen, target, tlen in self.dataloader:
+                lang2_txt.extend(convert_to_text(target, tlen, self.dico, params))
+
+            # # replace <unk> by <<unk>> as these tokens cannot be counted in BLEU
+            # lang2_txt = [x.replace('<unk>', '<<unk>>') for x in lang2_txt]
+
+            # export hypothesis
+            with open(lang2_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lang2_txt) + '\n')
+
+            # restore original segmentation
+            restore_segmentation(lang2_path)
 
 def convert_to_text(batch, lengths, dico, params):
     """
@@ -534,18 +709,18 @@ def convert_to_text(batch, lengths, dico, params):
     slen, bs = batch.shape
     assert lengths.max() == slen and lengths.shape[0] == bs
     assert (batch[0] == params.eos_index).sum() == bs
-    assert (batch == params.eos_index).sum() == 2 * bs
     sentences = []
 
     for j in range(bs):
         words = []
         for k in range(1, lengths[j]):
             if batch[k, j] == params.eos_index:
+                continue
+            elif batch[k, j] == params.end_index:
                 break
             words.append(dico[batch[k, j]])
         sentences.append(" ".join(words))
     return sentences
-
 
 def eval_moses_bleu(ref, hyp):
     """

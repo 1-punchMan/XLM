@@ -98,6 +98,7 @@ def set_dico_parameters(params, data, dico):
         params.pad_index = pad_index
         params.unk_index = unk_index
         params.mask_index = mask_index
+        params.end_index = dico.end_index
 
 
 def load_mono_data(params, data):
@@ -353,11 +354,12 @@ def load_data(params):
     return data
 
 class Wikisum_Dataset(Torch_dataset):
-    def __init__(self, data_list, dataset_path, n_paragraphs, maxlen):
+    def __init__(self, data_list, dataset_path, n_paragraphs, maxlen, end_index):
         self.data=data_list
         self.dataset_path=dataset_path
         self.n_paragraphs=n_paragraphs
         self.maxlen=maxlen
+        self.end_index=end_index
 
     def __getitem__(self, index):
         n_file, pos, length=self.data[index]
@@ -399,7 +401,7 @@ class Wikisum_Dataset(Torch_dataset):
             input+=less*[[]]
 
         target=item["targets"]["title"]["sentences"].astype(np.int64).tolist()
-        target+=item["targets"]["intro"]["sentences"].astype(np.int64).tolist()
+        target+=item["targets"]["intro"]["sentences"].astype(np.int64).tolist()+[self.end_index]
         target=target[:self.maxlen] if len(target) > self.maxlen else target
         
         return input, target
@@ -427,11 +429,13 @@ def load_wikisum_data(voc_path, dataset_path, params):
 
         DATASET+=[(n_file, pos, length) for pos, length in indices]
             
-    dataset=Wikisum_Dataset(DATASET, dataset_path, n_paragraphs=5, maxlen=params.bptt)
+    training_set=Wikisum_Dataset(DATASET[:-10000], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, end_index=dictionary.end_index)
+    valid_set=Wikisum_Dataset(DATASET[-10000:-5000][:8], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, end_index=dictionary.end_index)
+    test_set=Wikisum_Dataset(DATASET[-5000:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, end_index=dictionary.end_index)
     data["datasets"]={
-        "training": dataset,
-        "valid": None,
-        "test": None
+        "training": training_set,
+        "valid": valid_set,
+        "test": test_set
     }
     
     return data
