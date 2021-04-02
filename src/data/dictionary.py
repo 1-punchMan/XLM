@@ -25,6 +25,7 @@ SPECIAL_WORDS = 10
 SEP_WORD = SPECIAL_WORD % 0
 MASK_WORD = SPECIAL_WORD % 1
 END_WORD = SPECIAL_WORD % 2
+TITLE_WORD = SPECIAL_WORD % 3
 
 class Dictionary(object):
 
@@ -38,6 +39,7 @@ class Dictionary(object):
         self.pad_index = word2id[PAD_WORD]
         self.unk_index = word2id[UNK_WORD]
         self.end_index = word2id[END_WORD]
+        self.title_index = word2id[TITLE_WORD]
         self.check_valid()
 
     def __len__(self):
@@ -236,7 +238,7 @@ class Dictionary(object):
         """
         # BOS都用EOS
         # 模型的輸入開頭都加上EOS，而非每個句子開頭。
-        sentences = [dico.eos_index]
+        sentences = []
         unk_words = {}
 
         # index sentences
@@ -247,6 +249,7 @@ class Dictionary(object):
             # skip empty sentences
             if len(s) == 0:
                 print("Empty sentence in line %i." % i)
+                continue
             # index sentence words
             count_unk = 0
             indexed = []
@@ -262,19 +265,18 @@ class Dictionary(object):
                     unk_words[w] = unk_words.get(w, 0) + 1
                     count_unk += 1
             # add sentence
-            sentences.extend(indexed)
-            sentences.append(dico.eos_index)  # EOS index
-
+            sentences.append(indexed)
+            
         # tensorize data
         # 為節省空間，利用numpy的int32等型別儲存資料
         # 轉torch.tensor時要注意，參考XLM/src/data/dataset.py的batch_sentences()
         if len(dico) < 1 << 16:
-            sentences = np.uint16(sentences)
+            sentences = [np.uint16(sentence) for sentence in sentences]
         elif len(dico) < 1 << 31:
-            sentences = np.int32(sentences)
+            sentences = [np.int32(sentence) for sentence in sentences]
         else:
             raise Exception("Dictionary is too big.")
-        assert sentences.min() >= 0
+        assert sum([sentence.min() < 0 for sentence in sentences]) == 0
         data = {
             'sentences': sentences,
             'unk_words': unk_words,

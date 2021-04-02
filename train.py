@@ -271,8 +271,8 @@ def main(params):
                 trainer.step(lang1, lang2, batch)
 
             trainer.iter()
-            if i > 1000:
-                break 
+            # if i > 1000:
+            #     break 
         
         logger.info("============ End of epoch %i ============" % trainer.epoch)
 

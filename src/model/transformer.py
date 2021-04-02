@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from .memory import HashingMemory
 
-DEBUG=False
+DEBUG=[True, None, None, None]
 N_MAX_POSITIONS = 512  # maximum input sequence length
 
 DECODER_ONLY_PARAMS = [
@@ -187,7 +187,7 @@ class MultiHeadAttention(nn.Module):
 
             def shape(x):
                 """  projection """
-                return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2).contiguous()
+                return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
 
             def unshape(x):
                 """  compute context """
@@ -195,6 +195,7 @@ class MultiHeadAttention(nn.Module):
 
             q = shape(self.q_lin(input))                                          # (bs, n_heads, qlen, dim_per_head)
             if kv is None:
+                k=self.k_lin(input)
                 k = shape(self.k_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
                 v = shape(self.v_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
             elif cache is None or self.layer_id not in cache:
@@ -214,8 +215,7 @@ class MultiHeadAttention(nn.Module):
 
             q = q / math.sqrt(dim_per_head)                                       # (bs, n_heads, qlen, dim_per_head)
             scores = torch.matmul(q, k.transpose(2, 3))                           # (bs, n_heads, qlen, klen)
-            mask = (mask == 0).view(mask_reshape)               # (bs, n_heads, qlen, klen)
-            mask = mask.expand_as(scores)
+            mask = (mask == 0).view(mask_reshape).expand_as(scores)               # (bs, n_heads, qlen, klen)
             scores.masked_fill_(mask, -float('inf'))                              # (bs, n_heads, qlen, klen)
 
             weights = F.softmax(scores.float(), dim=-1).type_as(scores)           # (bs, n_heads, qlen, klen)
@@ -286,7 +286,7 @@ class Global_MultiHeadAttention(nn.Module):
 
     def __init__(self, n_heads, dim, dropout):
         super().__init__()
-        self.layer_id = next(MultiHeadAttention.NEW_ID)
+        self.layer_id = next(Global_MultiHeadAttention.NEW_ID)
         self.dim = dim
         self.n_heads = n_heads
         self.dim_per_head=self.dim // self.n_heads
@@ -490,14 +490,13 @@ class TransformerModel(nn.Module):
         if src_enc is not None:
             assert self.is_decoder
             assert src_enc.size(0) == bs
-
+            
         # generate masks
         mask, attn_mask = get_masks(slen, lengths, causal, is_decoder=self.is_decoder)
         global_mask=lengths != 0
         if self.is_decoder and src_enc is not None:
             src_mask = torch.arange(src_len.max(), dtype=torch.long, device=src_len.device) < src_len.unsqueeze(-1) # (bs, n_paragraphs, src_len.max())
             src_enc, src_mask=src_enc.reshape(bs, -1, self.dim), src_mask.reshape(bs, -1)
-                
         # positions
         if positions is None:
             positions = x.new(slen).long()
@@ -532,29 +531,21 @@ class TransformerModel(nn.Module):
         tensor = self.layer_norm_emb(tensor)
         tensor = F.dropout(tensor, p=self.dropout, training=self.training)
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
-        
+
+        # if self.is_encoder:
+        #     return tensor
+
         # transformer layers
         for i in range(self.n_layers):
-            if (tensor != tensor).any():
-                print("Gotcha!")
-                print("transformer layers:", i)
-                print("decoder:" if self.is_decoder else "encoder:")
-                print(tensor)
-                # exit()
-
+            # if i == 5 and self.is_encoder:
+            #     logger.info("enc_att_in:")
+            #     logger.info(f"{tensor}")
             # self attention
             attn = self.attentions[i](tensor, attn_mask, global_mask, cache=cache)
             attn = F.dropout(attn, p=self.dropout, training=self.training)
             tensor = tensor + attn
             tensor = self.layer_norm1[i](tensor)
-            if (tensor != tensor).any():
-                print("Gotcha!")
-                print("transformer layers:", i)
-                print("self attention")
-                print("decoder:" if self.is_decoder else "encoder:")
-                print(tensor)
-                # exit()
-
+            
             # encoder attention (for decoder only)
             if self.is_decoder and src_enc is not None:
                 attn = self.encoder_attn[i](tensor, src_mask, kv=src_enc, cache=cache)
@@ -567,14 +558,6 @@ class TransformerModel(nn.Module):
                 tensor = tensor + self.memories['%i_in' % i](tensor)
             else:
                 tensor = tensor + self.ffns[i](tensor)
-            if (tensor != tensor).any():
-                print("Gotcha!")
-                print("transformer layers:", i)
-                print("FFN:")
-                print("decoder:" if self.is_decoder else "encoder:")
-                print("tensor:")
-                print(tensor)
-                # exit()
             tensor = self.layer_norm2[i](tensor)
 
             # memory
@@ -584,6 +567,9 @@ class TransformerModel(nn.Module):
 
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
+            # if i == 5 and self.is_encoder:
+            #     logger.info("enc_layer_out:")
+            #     logger.info(f"{tensor}")
         # update cache length
         if cache is not None:
             cache['slen'] += tensor.size(1)
@@ -719,6 +705,8 @@ class TransformerModel(nn.Module):
         bs = len(src_len)
         n_words = self.n_words
 
+        # logger.info("src_enc_beam:")
+        # logger.info(f"{src_enc}")
         # expand to beam size the source latent representations / source lengths
         src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view((bs * beam_size,) + src_enc.shape[1:])
         src_len = src_len.unsqueeze(1).expand((bs, beam_size) + src_len.shape[1:]).contiguous().view((bs * beam_size,) + src_len.shape[1:])
@@ -765,13 +753,16 @@ class TransformerModel(nn.Module):
                 src_enc=src_enc,
                 src_len=src_len,
                 cache=cache
-            ).transpose(0, 1)   # (1, bs * beam_size, self.dim)
+            ).transpose(0, 1)   # (1, bs * beam_size, dim)
             assert tensor.size() == (1, bs * beam_size, self.dim)
             tensor = tensor.data[-1, :, :]               # (bs * beam_size, dim)
             scores = self.pred_layer.get_scores(tensor)  # (bs * beam_size, n_words)
+            # if cur_len == 1:
+            #     logger.info("scores_beam:")
+            #     logger.info(f"{scores.reshape(bs, beam_size, n_words)[:, 0]}")
             scores = F.log_softmax(scores, dim=-1)       # (bs * beam_size, n_words)
             assert scores.size() == (bs * beam_size, n_words)
-
+            
             # select next words with scores
             _scores = scores + beam_scores[:, None].expand_as(scores)  # (bs * beam_size, n_words)
             _scores = _scores.view(bs, beam_size * n_words)            # (bs, beam_size * n_words)
@@ -839,19 +830,16 @@ class TransformerModel(nn.Module):
             if all(done):
                 break
 
-        # visualize hypotheses
-        print([len(x) for x in generated_hyps], cur_len)
-        globals().update( locals() )
-        #import code; code.interact(local=vars())
-        for ii in range(bs):
-            for ss, ww in sorted(generated_hyps[ii].hyp, key=lambda x: x[0], reverse=True):
-                print("%.3f " % ss + " ".join(self.dico[x] for x in ww.tolist()))
-            print("")
+            # # visualize hypotheses
+            # generated_debug=generated.t().reshape(bs, beam_size, max_len)
+            # logger.info(f"{[len(x) for x in generated_debug]} {cur_len}")
+            # for ww in generated_debug[0]:
+            #     logger.info(" ".join(self.dico[x] for x in ww.tolist()))
+            # logger.info("")
 
         # select the best hypotheses
         tgt_len = src_len.new(bs)
         best = []
-        print(generated_hyps[0].hyp)
         for i, hypotheses in enumerate(generated_hyps):
             best_hyp = max(hypotheses.hyp, key=lambda x: x[0])[1]
             tgt_len[i] = len(best_hyp) + 1  # +1 for the <END> symbol
@@ -884,6 +872,10 @@ class Global_Transformer(nn.Module):
         self.attention_dropout = params.attention_dropout
         assert self.dim % self.n_heads == 0, 'transformer dim must be a multiple of n_heads'
 
+        # embedding
+        self.title_embeddings = Embedding(2, self.dim)
+        self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
+
         # transformer layers
         self.attentions = nn.ModuleList()
         self.layer_norm1 = nn.ModuleList()
@@ -896,7 +888,7 @@ class Global_Transformer(nn.Module):
             self.ffns.append(TransformerFFN(self.dim, self.hidden_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
             self.layer_norm2.append(nn.LayerNorm(self.dim, eps=1e-12))
 
-    def forward(self, input, lengths):
+    def forward(self, input, lengths, title_emb):
         # input的size：(bs, n_paragraphs, slen, dim)
         
         bs, n_paragraphs, slen, dim = input.size()
@@ -905,13 +897,20 @@ class Global_Transformer(nn.Module):
         mask, attn_mask = get_masks(slen, lengths, causal=False, is_decoder=False)
         global_mask=lengths != 0
 
+        # embeddings
+        tensor = input + self.title_embeddings(title_emb)
+        tensor = self.layer_norm_emb(tensor)
+        tensor = F.dropout(tensor, p=self.dropout, training=self.training)
+        tensor *= mask.unsqueeze(-1).to(tensor.dtype)
+
         # transformer layers
+        # tensor=input
         for i in range(self.n_layers):
 
             # self attention
-            attn = self.attentions[i](input, attn_mask, global_mask)
+            attn = self.attentions[i](tensor, attn_mask, global_mask)
             attn = F.dropout(attn, p=self.dropout, training=self.training)    # (bs, n_paragraphs, dim)
-            tensor = attn.contiguous().unsqueeze(dim=2) + input # 第2維會廣播
+            tensor = attn.contiguous().unsqueeze(dim=2) + tensor # 第2維會廣播
             tensor = self.layer_norm1[i](tensor)
 
             # FFN

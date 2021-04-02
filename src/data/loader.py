@@ -99,6 +99,7 @@ def set_dico_parameters(params, data, dico):
         params.unk_index = unk_index
         params.mask_index = mask_index
         params.end_index = dico.end_index
+        params.title_index = dico.title_index
 
 
 def load_mono_data(params, data):
@@ -354,55 +355,57 @@ def load_data(params):
     return data
 
 class Wikisum_Dataset(Torch_dataset):
-    def __init__(self, data_list, dataset_path, n_paragraphs, maxlen, end_index):
+    def __init__(self, data_list, dataset_path, n_paragraphs, maxlen, dico):
         self.data=data_list
         self.dataset_path=dataset_path
         self.n_paragraphs=n_paragraphs
         self.maxlen=maxlen
-        self.end_index=end_index
+        self.dico=dico
 
     def __getitem__(self, index):
+        eos_index=self.dico.eos_index
+        title_index=self.dico.title_index
+        maxlen=self.maxlen
+        n_paragraphs=self.n_paragraphs
+
         n_file, pos, length=self.data[index]
         file=f"{self.dataset_path}/dataset-{n_file:>05}-of-01000.pkl"
         with open(file, 'rb') as f:
             f.seek(pos)
             item=pickle.loads(f.read(length))
 
-        input_title=item["inputs"]["title"]["sentences"].astype(np.int64).tolist()
+        title=item["inputs"]["title"]["sentence"].astype(np.int64).tolist()
+        input=[[eos_index] + title + [eos_index]]
+        start, para_cnt=0, 0
+        paragraphs=item["inputs"]["paragraphs"]["sentences"]
+        for i, paragraph in enumerate(paragraphs):
+            paragraph=paragraph.astype(np.int64).tolist()
+            if para_cnt >= n_paragraphs: break
+            length=len(paragraph)
+            if length + 2 > maxlen: # 留空間給<EOS>
+                start=0
 
-        input=[input_title]
-        start, cnt, para_cnt, last=0, 0, 0, False
-        paragraphs=item["inputs"]["paragraphs"]["sentences"].astype(np.int64).tolist()
-        for i, token in enumerate(paragraphs):
-            if para_cnt >= self.n_paragraphs: break
-            cnt+=1
-            if cnt == self.maxlen:
-                # 加一段
-                end=i+1
-                input.append(paragraphs[start:end])
-                para_cnt+=1
-                if token == 1:
-                    start, cnt=i, 1
-                    last=False
-                else:
-                    start, cnt=i+1, 0
-                    last=True
-            elif token == 1 and i != 0:
-                if not last:
+                # 捨棄最後一段
+                while length + 2 >= maxlen:
                     # 加一段
-                    end=i+1
-                    input.append(paragraphs[start:end])
+                    input.append([eos_index] + paragraph[start:start+maxlen] + [eos_index])
+                    length-=maxlen
+                    start+=maxlen
                     para_cnt+=1
-                start, cnt=i, 1
-                last=False
+            else:
+                input.append([eos_index] + paragraph + [eos_index])
+                para_cnt+=1
 
-        if para_cnt < self.n_paragraphs:
-            less=self.n_paragraphs-para_cnt
+        if para_cnt < n_paragraphs:
+            less=n_paragraphs-para_cnt
             input+=less*[[]]
 
-        target=item["targets"]["title"]["sentences"].astype(np.int64).tolist()
-        target+=item["targets"]["intro"]["sentences"].astype(np.int64).tolist()+[self.end_index]
-        target=target[:self.maxlen] if len(target) > self.maxlen else target
+        title=item["targets"]["title"]["sentence"].astype(np.int64).tolist()
+        intro=[sentence.astype(np.int64).tolist() for sentence in item["targets"]["intro"]["sentences"]]
+        target=[title] + intro
+        target=[[eos_index] + sentence + [eos_index] for sentence in target]
+        target=[token for sentence in target for token in sentence] + [self.dico.end_index]
+        target=target[:maxlen] if len(target) > maxlen else target
         
         return input, target
 
@@ -429,9 +432,12 @@ def load_wikisum_data(voc_path, dataset_path, params):
 
         DATASET+=[(n_file, pos, length) for pos, length in indices]
             
-    training_set=Wikisum_Dataset(DATASET[:-10000], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, end_index=dictionary.end_index)
-    valid_set=Wikisum_Dataset(DATASET[-10000:-5000][:8], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, end_index=dictionary.end_index)
-    test_set=Wikisum_Dataset(DATASET[-5000:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, end_index=dictionary.end_index)
+    training_set=Wikisum_Dataset(
+        DATASET[:-10000], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
+    valid_set=Wikisum_Dataset(
+        DATASET[-10000:-5000], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
+    test_set=Wikisum_Dataset(
+        DATASET[-5000:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
     data["datasets"]={
         "training": training_set,
         "valid": valid_set,

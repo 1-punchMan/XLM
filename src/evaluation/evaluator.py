@@ -6,17 +6,19 @@
 #
 
 from logging import getLogger
-import os
+import os, sys
 import subprocess
 from collections import OrderedDict
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from rouge import FilesRouge
 
 from ..utils import to_cuda, restore_segmentation, concat_batches
 from ..model.memory import HashingMemory
 from ..trainer import collate
 
+from ..model.transformer import DEBUG
 
 BLEU_SCRIPT_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'multi-bleu.perl')
 assert os.path.isfile(BLEU_SCRIPT_PATH)
@@ -540,10 +542,32 @@ class WikisumEvaluator(Evaluator):
                 data["datasets"][data_set],
                 batch_size=params.batch_size,
                 collate_fn=lambda samples: collate(samples, pad_index))
+                
+        # rouge套件計算ROUGE-L是用遞迴方式實作，空間複雜度為O(m * n), m, n: 句子長度
+        # 會超出預設的遞迴次數上限
+        # 所以將上限調高
+        sys.setrecursionlimit((params.bptt+1) * (params.bptt+1))
 
         super().__init__(trainer, data, params)
 
+    def save_text(self, sentences, path):
+        """ 將輸入的中文list存成character-based的檔案 """
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(sentences) + '\n')
+
+        # restore original segmentation
+        restore_segmentation(path)
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            sentences=f.readlines()
+            sentences=[''.join(sentence[:-1].split(' ')) for sentence in sentences]
+            sentences=[' '.join(list(sentence )) if sentence else ' ' for sentence in sentences]
+            
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(sentences) + '\n')
+
     def evaluate_ws(self, scores, lang1, lang2):
+        global DEBUG
         """
         Evaluate perplexity and next word prediction accuracy.
         """
@@ -575,12 +599,16 @@ class WikisumEvaluator(Evaluator):
         hypothesis = []
 
         for i, batch in enumerate(self.dataloader):
+            DEBUG[0]=True
             # generate batch
             inputs, ilen, target, tlen = batch
 
-            print("input:")
-            for para in inputs[0].tolist():
-                print(' '.join([self.data["dico"][id] for id in para]))
+            # logger.info("input1:")
+            # for para in inputs[0].tolist():
+            #     logger.info(' '.join([self.data["dico"][id] for id in para]))
+            # logger.info("input2:")
+            # for para in inputs[1].tolist():
+            #     logger.info(' '.join([self.data["dico"][id] for id in para]))
 
             # target words to predict
             alen = torch.arange(tlen.max(), dtype=torch.long, device=tlen.device)
@@ -598,17 +626,31 @@ class WikisumEvaluator(Evaluator):
 
             # encode source sentence
             local_enc_out = local_encoder('fwd', x=inputs, lengths=ilen, langs=langs1, causal=False)    # (bs, n_paragraphs, slen, dim)
-            global_enc_out=global_encoder(local_enc_out, lengths=ilen)    # (bs, n_paragraphs, slen, dim)
+            
+            # t1=local_enc_out[0][0][0]
+            # t2=local_enc_out[1][0][1]
+            # logger.info(f"{abs(t2-t1)}")
+            # exit()
+
+            title_emb=inputs.clone()
+            title_emb[:, 0], title_emb[:, 1:]=0, 1
+
+            global_enc_out=global_encoder(local_enc_out, lengths=ilen, title_emb=title_emb)    # (bs, n_paragraphs, slen, dim)
+            # global_enc_out=local_enc_out    # (bs, n_paragraphs, slen, dim)
             global_enc_out = global_enc_out.half() if params.fp16 else global_enc_out
 
             target, tlen, langs2, pred_mask, y=[t.cuda() for t in [target, tlen, langs2, pred_mask, y]]
-            
+
             # decode target sentence
             dec_out = decoder('fwd', x=target, lengths=tlen, langs=langs2, causal=True, src_enc=global_enc_out, src_len=ilen)  # (bs, tlen, dim)
 
+            # logger.info("dec_out:")
+            # logger.info(f"{dec_out[:, 0, :]}")
             # loss
             word_scores, loss = decoder('predict', tensor=dec_out.transpose(0, 1), pred_mask=pred_mask, y=y, get_scores=True)
             
+            # logger.info("scores:")
+            # logger.info(f"{word_scores[:dec_out.size(0)]}")
             # update stats
             n_words += y.size(0)
             xe_loss += loss.item() * len(y)
@@ -616,7 +658,7 @@ class WikisumEvaluator(Evaluator):
             if eval_memory:
                 for k, v in self.memory_list:
                     all_mem_att[k].append((v.last_indices, v.last_scores))
-
+            DEBUG[0]=True
             # generate translation - translate / convert to text
             if params.beam_size == 1:
                 generated, lengths = decoder.generate(global_enc_out, ilen, lang2_id, max_len=params.bptt)
@@ -628,9 +670,7 @@ class WikisumEvaluator(Evaluator):
                     max_len=params.bptt
                 )
             hypothesis.extend(convert_to_text(generated, lengths, self.dico, params))
-
-            if i % 5 == 0:
-                print(hypothesis[i*self.params.batch_size])
+            
         # compute perplexity and prediction accuracy
         scores['%s_%s-%s_ws_ppl' % (self.data_set, lang1, lang2)] = np.exp(xe_loss / n_words)
         scores['%s_%s-%s_ws_acc' % (self.data_set, lang1, lang2)] = 100. * n_valid / n_words
@@ -648,14 +688,12 @@ class WikisumEvaluator(Evaluator):
         ref_path = params.ref_paths[(lang1, lang2, self.data_set)]
 
         # export sentences to hypothesis file / restore BPE segmentation
-        with open(hyp_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(hypothesis) + '\n')
-        restore_segmentation(hyp_path)
+        self.save_text(hypothesis, hyp_path)
 
-        # # evaluate BLEU score
-        # bleu = eval_moses_bleu(ref_path, hyp_path)
-        # logger.info("BLEU %s %s : %f" % (hyp_path, ref_path, bleu))
-        # scores['%s_%s-%s_mt_bleu' % (self.data_set, lang1, lang2)] = bleu
+        # evaluate ROUGE score
+        rouge_L = eval_rouge(ref_path, hyp_path)['rouge-l']['f']
+        logger.info("ROUGE-L %s %s : %f" % (hyp_path, ref_path, rouge_L))
+        scores['%s_%s-%s_ws_rouge_L' % (self.data_set, lang1, lang2)] = rouge_L
 
     def evaluate(self, trainer):
         params = self.params
@@ -693,11 +731,7 @@ class WikisumEvaluator(Evaluator):
             # lang2_txt = [x.replace('<unk>', '<<unk>>') for x in lang2_txt]
 
             # export hypothesis
-            with open(lang2_path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(lang2_txt) + '\n')
-
-            # restore original segmentation
-            restore_segmentation(lang2_path)
+            self.save_text(lang2_txt, lang2_path)
 
 def convert_to_text(batch, lengths, dico, params):
     """
@@ -714,7 +748,7 @@ def convert_to_text(batch, lengths, dico, params):
     for j in range(bs):
         words = []
         for k in range(1, lengths[j]):
-            if batch[k, j] == params.eos_index:
+            if batch[k, j] == params.eos_index or batch[k, j] == params.title_index:
                 continue
             elif batch[k, j] == params.end_index:
                 break
@@ -738,3 +772,9 @@ def eval_moses_bleu(ref, hyp):
     else:
         logger.warning('Impossible to parse BLEU score! "%s"' % result)
         return -1
+
+def eval_rouge(ref, hyp):
+    files_rouge = FilesRouge()
+    scores = files_rouge.get_scores(hyp, ref, avg=True)
+
+    return scores

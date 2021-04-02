@@ -146,6 +146,17 @@ class Trainer(object):
         # model (excluding memory values)
         self.parameters['model'] = [p for k, p in named_params if not k.endswith(HashingMemory.MEM_VALUES_PARAMS)]
 
+        named_params1, named_params2 = [], []
+        for name in self.MODEL_NAMES:
+            if name == "local_encoder":
+                named_params1.extend([(k, p) for k, p in getattr(self, name).named_parameters() if p.requires_grad])
+            else:
+                named_params2.extend([(k, p) for k, p in getattr(self, name).named_parameters() if p.requires_grad])
+
+        # model (excluding memory values)
+        self.parameters['fine-tune'] = [p for k, p in named_params1 if not k.endswith(HashingMemory.MEM_VALUES_PARAMS)]
+        self.parameters['rand_init'] = [p for k, p in named_params2 if not k.endswith(HashingMemory.MEM_VALUES_PARAMS)]
+
         # memory values
         if params.use_memory:
             self.parameters['memory'] = [p for k, p in named_params if k.endswith(HashingMemory.MEM_VALUES_PARAMS)]
@@ -164,7 +175,10 @@ class Trainer(object):
         self.optimizers = {}
 
         # model optimizer (excluding memory values)
-        self.optimizers['model'] = get_optimizer(self.parameters['model'], params.optimizer)
+        self.optimizers['model'] = get_optimizer([
+                # {'params': self.parameters['fine-tune'], 'lr': 1e-5},
+                {'params': self.parameters['rand_init']}
+            ], params.optimizer)
 
         # memory values optimizer
         if params.use_memory:
@@ -507,6 +521,7 @@ class Trainer(object):
             'n_total_iter': self.n_total_iter,
             'best_metrics': self.best_metrics,
             'best_stopping_criterion': self.best_stopping_criterion,
+            'decrease_counts': self.decrease_counts
         }
 
         for name in self.MODEL_NAMES:
@@ -563,6 +578,7 @@ class Trainer(object):
         self.n_total_iter = data['n_total_iter']
         self.best_metrics = data['best_metrics']
         self.best_stopping_criterion = data['best_stopping_criterion']
+        self.decrease_counts = data['decrease_counts']
         logger.warning(f"Checkpoint reloaded. Resuming at epoch {self.epoch} / iteration {self.n_total_iter} ...")
 
     def save_periodic(self):
@@ -606,6 +622,7 @@ class Trainer(object):
             else:
                 logger.info("Not a better validation score (%i / %i)."
                             % (self.decrease_counts, self.decrease_counts_max))
+                logger.info("Best validation score: %f" % self.best_stopping_criterion)
                 self.decrease_counts += 1
             if self.decrease_counts > self.decrease_counts_max:
                 logger.info("Stopping criterion has been below its best value for more "
@@ -949,7 +966,7 @@ def collate(samples, padding_value):
         seq = pad_sequence(seq, padding_value=padding_value)
         inputs.append(seq)
 
-    inputs = pad_sequence(inputs, padding_value=2)  # (slen, n_paragraphs, bs)
+    inputs = pad_sequence(inputs, padding_value=padding_value)  # (slen, n_paragraphs, bs)
     ilen=torch.stack(ilen)  # (n_paragraphs, bs)
     ilen=ilen.t()  # (bs, n_paragraphs)
     inputs=inputs.permute(2, 1, 0)  # (bs, n_paragraphs, slen)
@@ -998,10 +1015,6 @@ class WikisumTrainer(Trainer):
         
         inputs, ilen, target, tlen = batch
 
-        # print("input:")
-        # for para in inputs[0].tolist():
-        #     print(' '.join([self.data["dico"][id] for id in para]))
-
         # print("target:")
         # print(' '.join([self.data["dico"][id] for id in target[:, 0].tolist()]))
 
@@ -1023,10 +1036,20 @@ class WikisumTrainer(Trainer):
 
         # encode source sentence
         local_enc_out = self.local_encoder('fwd', x=inputs, lengths=ilen, langs=langs1, causal=False)    # (bs, n_paragraphs, slen, dim)
-        global_enc_out=self.global_encoder(local_enc_out, lengths=ilen)    # (bs, n_paragraphs, slen, dim)
+
+        title_emb=inputs.clone()
+        title_emb[:, 0], title_emb[:, 1:]=0, 1
         
+        global_enc_out=self.global_encoder(local_enc_out, lengths=ilen, title_emb=title_emb)    # (bs, n_paragraphs, slen, dim)
+        # global_enc_out=local_enc_out    # (bs, n_paragraphs, slen, dim)
         target, tlen, langs2, pred_mask, y=[t.cuda() for t in [target, tlen, langs2, pred_mask, y]]
         
+        # 檢查encoder有沒有學壞，把每個字的向量學成一樣。
+        if self.n_iter % 1000 == 0:
+            t1=global_enc_out[0][0][0]
+            t2=global_enc_out[1][0][1]
+            assert (abs(t2-t1) > 1e-3).any()
+
         # decode target sentence
         dec_out = self.decoder('fwd', x=target, lengths=tlen, langs=langs2, causal=True, src_enc=global_enc_out, src_len=ilen)  # (bs, tlen, dim)
 
