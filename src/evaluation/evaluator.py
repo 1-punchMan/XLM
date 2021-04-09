@@ -599,9 +599,9 @@ class WikisumEvaluator(Evaluator):
         hypothesis = []
 
         for i, batch in enumerate(self.dataloader):
-            DEBUG[0]=True
+
             # generate batch
-            inputs, ilen, target, tlen = batch
+            inputs, ilen, target, tlen, title_len = batch
 
             # logger.info("input1:")
             # for para in inputs[0].tolist():
@@ -635,8 +635,8 @@ class WikisumEvaluator(Evaluator):
             title_emb=inputs.clone()
             title_emb[:, 0], title_emb[:, 1:]=0, 1
 
-            global_enc_out=global_encoder(local_enc_out, lengths=ilen, title_emb=title_emb)    # (bs, n_paragraphs, slen, dim)
-            # global_enc_out=local_enc_out    # (bs, n_paragraphs, slen, dim)
+            # global_enc_out=global_encoder(local_enc_out, lengths=ilen, title_emb=title_emb)    # (bs, n_paragraphs, slen, dim)
+            global_enc_out=local_enc_out    # (bs, n_paragraphs, slen, dim)
             global_enc_out = global_enc_out.half() if params.fp16 else global_enc_out
 
             target, tlen, langs2, pred_mask, y=[t.cuda() for t in [target, tlen, langs2, pred_mask, y]]
@@ -658,10 +658,21 @@ class WikisumEvaluator(Evaluator):
             if eval_memory:
                 for k, v in self.memory_list:
                     all_mem_att[k].append((v.last_indices, v.last_scores))
-            DEBUG[0]=True
+                    
             # generate translation - translate / convert to text
             if params.beam_size == 1:
                 generated, lengths = decoder.generate(global_enc_out, ilen, lang2_id, max_len=params.bptt)
+            elif params.given_titles:
+                titles=[target[i, :l] for i, l in enumerate(title_len)]
+
+                generated, lengths = decoder.generate_beam_given_titles(
+                    global_enc_out, ilen, lang2_id, beam_size=params.beam_size,
+                    length_penalty=params.length_penalty,
+                    early_stopping=params.early_stopping,
+                    titles=titles,
+                    title_len=title_len,
+                    max_len=params.bptt
+                )
             else:
                 generated, lengths = decoder.generate_beam(
                     global_enc_out, ilen, lang2_id, beam_size=params.beam_size,
@@ -669,7 +680,7 @@ class WikisumEvaluator(Evaluator):
                     early_stopping=params.early_stopping,
                     max_len=params.bptt
                 )
-            hypothesis.extend(convert_to_text(generated, lengths, self.dico, params))
+            hypothesis.extend(WS_convert_to_text(generated, lengths, self.dico, params, title_len))
             
         # compute perplexity and prediction accuracy
         scores['%s_%s-%s_ws_ppl' % (self.data_set, lang1, lang2)] = np.exp(xe_loss / n_words)
@@ -724,8 +735,8 @@ class WikisumEvaluator(Evaluator):
             lang2_txt = []
 
             # convert to text
-            for inputs, ilen, target, tlen in self.dataloader:
-                lang2_txt.extend(convert_to_text(target, tlen, self.dico, params))
+            for inputs, ilen, target, tlen, title_len in self.dataloader:
+                lang2_txt.extend(WS_convert_to_text(target, tlen, self.dico, params, title_len))
 
             # # replace <unk> by <<unk>> as these tokens cannot be counted in BLEU
             # lang2_txt = [x.replace('<unk>', '<<unk>>') for x in lang2_txt]
@@ -748,6 +759,29 @@ def convert_to_text(batch, lengths, dico, params):
     for j in range(bs):
         words = []
         for k in range(1, lengths[j]):
+            if batch[k, j] == params.eos_index or batch[k, j] == params.title_index:
+                continue
+            elif batch[k, j] == params.end_index:
+                break
+            words.append(dico[batch[k, j]])
+        sentences.append(" ".join(words))
+    return sentences
+
+def WS_convert_to_text(batch, lengths, dico, params, title_len):
+    """
+    Convert a batch of sentences to a list of text sentences.
+    """
+    batch = batch.cpu().numpy()
+    lengths = lengths.cpu().numpy()
+
+    slen, bs = batch.shape
+    assert lengths.max() == slen and lengths.shape[0] == bs
+    assert (batch[0] == params.eos_index).sum() == bs
+    sentences = []
+
+    for j in range(bs):
+        words = []
+        for k in range(title_len[j], lengths[j]):
             if batch[k, j] == params.eos_index or batch[k, j] == params.title_index:
                 continue
             elif batch[k, j] == params.end_index:

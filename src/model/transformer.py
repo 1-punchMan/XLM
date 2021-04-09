@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from .memory import HashingMemory
 
@@ -856,6 +857,196 @@ class TransformerModel(nn.Module):
 
         return decoded, tgt_len
 
+    def generate_beam_given_titles(self, src_enc, src_len, tgt_lang_id, beam_size, length_penalty, early_stopping, titles, title_len, max_len=200):
+        """
+        Decode a sentence given initial start.
+        `x`:
+            - LongTensor(bs, slen)
+                <EOS> W1 W2 W3 <EOS> <PAD>
+                <EOS> W1 W2 W3   W4  <EOS>
+        `lengths`:
+            - LongTensor(bs) [5, 6]
+        `positions`:
+            - False, for regular "arange" positions (LM)
+            - True, to reset positions from the new generation (MT)
+        `langs`:
+            - must be None if the model only supports one language
+            - lang_id if only one language is involved (LM)
+            - (lang_id1, lang_id2) if two languages are involved (MT)
+        `titles`:
+            - list
+        """
+
+        # check inputs
+        assert src_enc.size(0) == src_len.size(0)
+        assert beam_size >= 1
+
+        # batch size / number of words
+        bs = len(src_len)
+        n_words = self.n_words
+
+        # logger.info("src_enc_beam:")
+        # logger.info(f"{src_enc}")
+        # expand to beam size the source latent representations / source lengths
+        src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view((bs * beam_size,) + src_enc.shape[1:])
+        src_len = src_len.unsqueeze(1).expand((bs, beam_size) + src_len.shape[1:]).contiguous().view((bs * beam_size,) + src_len.shape[1:])
+
+        titles = pad_sequence(titles, padding_value=self.pad_index) # (slen, bs)
+
+        # generated sentences (batch with beam current hypotheses)
+        generated = src_len.new(max_len, bs)  # upcoming output
+        generated.fill_(self.pad_index)                   # fill upcoming ouput with <PAD>
+        generated[:len(titles)] = titles
+        generated = generated.unsqueeze(-1).expand(max_len, bs, beam_size).reshape(max_len, bs * beam_size)
+
+        # generated hypotheses
+        generated_hyps = [BeamHypotheses(beam_size, max_len, length_penalty, early_stopping) for _ in range(bs)]
+
+        # positions
+        positions = src_len.new(max_len).long()
+        positions = torch.arange(max_len, out=positions).unsqueeze(1).expand_as(generated)
+
+        # language IDs
+        langs = positions.clone().fill_(tgt_lang_id)
+
+        # scores for each sentence in the beam
+        beam_scores = src_enc.new(bs, beam_size).fill_(0)
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)
+
+        # current position
+        cur_len = 1
+
+        # cache compute states
+        cache = {'slen': 0}
+
+        # done sentences
+        done = [False for _ in range(bs)]
+
+        while cur_len < max_len:
+            
+            # compute word scores
+            tensor = self.forward(
+                'fwd',
+                x=generated[:cur_len].t(),
+                lengths=src_len.new(bs * beam_size).fill_(cur_len),
+                positions=positions[:cur_len].t(),
+                langs=langs[:cur_len].t(),
+                causal=True,
+                src_enc=src_enc,
+                src_len=src_len,
+                cache=cache
+            ).transpose(0, 1)   # (1, bs * beam_size, dim)
+            assert tensor.size() == (1, bs * beam_size, self.dim)
+            tensor = tensor.data[-1, :, :]               # (bs * beam_size, dim)
+            scores = self.pred_layer.get_scores(tensor)  # (bs * beam_size, n_words)
+            # if cur_len == 1:
+            #     logger.info("scores_beam:")
+            #     logger.info(f"{scores.reshape(bs, beam_size, n_words)[:, 0]}")
+            scores = F.log_softmax(scores, dim=-1)       # (bs * beam_size, n_words)
+            assert scores.size() == (bs * beam_size, n_words)
+            
+            # select next words with scores
+            _scores = scores + beam_scores[:, None].expand_as(scores)  # (bs * beam_size, n_words)
+            _scores = _scores.view(bs, beam_size * n_words)            # (bs, beam_size * n_words)
+
+            next_scores, next_words = torch.topk(_scores, 2 * beam_size, dim=1, largest=True, sorted=True)
+            assert next_scores.size() == next_words.size() == (bs, 2 * beam_size)
+
+            # next batch beam content
+            # list of (bs * beam_size) tuple(next hypothesis score, next word, current position in the batch)
+            next_batch_beam = []
+
+            # for each sentence
+            for sent_id in range(bs):
+
+                # 如果是開頭給定的標題
+                if cur_len < title_len[sent_id]:
+                    for i in range(beam_size):
+                        idx = sent_id * beam_size + i
+                        next_batch_beam.append((beam_scores[idx], generated[cur_len, idx], idx))
+                        
+                    continue
+
+                # if we are done with this sentence
+                done[sent_id] = done[sent_id] or generated_hyps[sent_id].is_done(next_scores[sent_id].max().item())
+                if done[sent_id]:
+                    next_batch_beam.extend([(0, self.pad_index, 0)] * beam_size)  # pad the batch
+                    continue
+
+                # next sentence beam content
+                next_sent_beam = []
+
+                # next words for this sentence
+                for idx, value in zip(next_words[sent_id], next_scores[sent_id]):
+
+                    # get beam and word IDs
+                    beam_id = idx // n_words
+                    word_id = idx % n_words
+                    
+                    # end of sentence, or next word
+                    if word_id == self.end_index or cur_len + 1 == max_len:
+                        generated_hyps[sent_id].add(generated[:cur_len, sent_id * beam_size + beam_id].clone(), value.item())
+                    else:
+                        next_sent_beam.append((value, word_id, sent_id * beam_size + beam_id))
+
+                    # the beam for next step is full
+                    if len(next_sent_beam) == beam_size:
+                        break
+
+                # update next beam content
+                assert len(next_sent_beam) == 0 if cur_len + 1 == max_len else beam_size
+                if len(next_sent_beam) == 0:
+                    next_sent_beam = [(0, self.pad_index, 0)] * beam_size  # pad the batch
+                next_batch_beam.extend(next_sent_beam)
+                assert len(next_batch_beam) == beam_size * (sent_id + 1)
+
+            # sanity check / prepare next batch
+            assert len(next_batch_beam) == bs * beam_size
+            beam_scores = beam_scores.new([x[0] for x in next_batch_beam])
+            beam_words = generated.new([x[1] for x in next_batch_beam])
+            beam_idx = src_len.new([x[2] for x in next_batch_beam])
+
+            # re-order batch and internal states
+            generated = generated[:, beam_idx]
+            generated[cur_len] = beam_words
+            for k in cache.keys():
+                if k != 'slen':
+                    cache[k] = (cache[k][0][beam_idx], cache[k][1][beam_idx])
+
+            # update current length
+            cur_len = cur_len + 1
+
+            # stop when we are done with each sentence
+            if all(done):
+                break
+
+            # # visualize hypotheses
+            # generated_debug=generated.t().reshape(bs, beam_size, max_len)
+            # logger.info(f"{[len(x) for x in generated_debug]} {cur_len}")
+            # for ww in generated_debug[0]:
+            #     logger.info(" ".join(self.dico[x] for x in ww.tolist()))
+            # logger.info("")
+
+        # select the best hypotheses
+        tgt_len = src_len.new(bs)
+        best = []
+        for i, hypotheses in enumerate(generated_hyps):
+            best_hyp = max(hypotheses.hyp, key=lambda x: x[0])[1]
+            tgt_len[i] = len(best_hyp) + 1  # +1 for the <END> symbol
+            best.append(best_hyp)
+
+        # generate target batch
+        decoded = src_len.new(tgt_len.max().item(), bs).fill_(self.pad_index)
+        for i, hypo in enumerate(best):
+            decoded[:tgt_len[i] - 1, i] = hypo
+            decoded[tgt_len[i] - 1, i] = self.end_index
+
+        # sanity check
+        assert (decoded == self.end_index).sum() == bs
+
+        return decoded, tgt_len
+
 class Global_Transformer(nn.Module):
 
     ATTRIBUTES = ['dim', 'n_layers', 'n_heads', 'hidden_dim', 'dropout', 'attention_dropout']
@@ -872,9 +1063,9 @@ class Global_Transformer(nn.Module):
         self.attention_dropout = params.attention_dropout
         assert self.dim % self.n_heads == 0, 'transformer dim must be a multiple of n_heads'
 
-        # embedding
-        self.title_embeddings = Embedding(2, self.dim)
-        self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
+        # # embedding
+        # self.title_embeddings = Embedding(2, self.dim)
+        # self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
 
         # transformer layers
         self.attentions = nn.ModuleList()
@@ -897,16 +1088,16 @@ class Global_Transformer(nn.Module):
         mask, attn_mask = get_masks(slen, lengths, causal=False, is_decoder=False)
         global_mask=lengths != 0
 
-        # embeddings
-        tensor = input + self.title_embeddings(title_emb)
-        tensor = self.layer_norm_emb(tensor)
-        tensor = F.dropout(tensor, p=self.dropout, training=self.training)
-        tensor *= mask.unsqueeze(-1).to(tensor.dtype)
+        # # embeddings
+        # tensor = input + self.title_embeddings(title_emb)
+        # tensor = self.layer_norm_emb(tensor)
+        # tensor = F.dropout(tensor, p=self.dropout, training=self.training)
+        # tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
         # transformer layers
-        # tensor=input
+        tensor=input
         for i in range(self.n_layers):
-
+            if i < self.n_layers-1: continue
             # self attention
             attn = self.attentions[i](tensor, attn_mask, global_mask)
             attn = F.dropout(attn, p=self.dropout, training=self.training)    # (bs, n_paragraphs, dim)

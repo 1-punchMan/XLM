@@ -978,7 +978,9 @@ def collate(samples, padding_value):
     target=[torch.LongTensor(targ) for targ in target]
     target = pad_sequence(target, padding_value=padding_value)
 
-    return inputs, ilen, target, tlen
+    title_len = [s[2] for s in samples]
+
+    return inputs, ilen, target, tlen, title_len
     # inputs size: (bs, n_paragraphs, slen)
     # ilen size: (bs, n_paragraphs)
     # target size: (slen, bs)

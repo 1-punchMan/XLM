@@ -193,6 +193,8 @@ def get_parser():
                         help="Length penalty, values < 1.0 favor shorter sentences, while values > 1.0 favor longer ones.")
     parser.add_argument("--early_stopping", type=bool_flag, default=False,
                         help="Early stopping, stop as soon as we have `beam_size` hypotheses, although longer ones may have better scores.")
+    parser.add_argument("--given_titles", type=bool_flag, default=False,
+                        help="Given titles when generating sentences.")
 
     # evaluation
     parser.add_argument("--eval_bleu", type=bool_flag, default=False,

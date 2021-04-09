@@ -407,7 +407,7 @@ class Wikisum_Dataset(Torch_dataset):
         target=[token for sentence in target for token in sentence] + [self.dico.end_index]
         target=target[:maxlen] if len(target) > maxlen else target
         
-        return input, target
+        return input, target, len(title) + 2
 
     def __len__(self):
         return len(self.data)
@@ -435,7 +435,7 @@ def load_wikisum_data(voc_path, dataset_path, params):
     training_set=Wikisum_Dataset(
         DATASET[:-10000], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
     valid_set=Wikisum_Dataset(
-        DATASET[-10000:-5000], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
+        DATASET[-10000:-5000][:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
     test_set=Wikisum_Dataset(
         DATASET[-5000:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
     data["datasets"]={
