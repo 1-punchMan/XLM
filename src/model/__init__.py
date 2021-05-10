@@ -137,7 +137,7 @@ def build_model(params, dico):
         logger.info("Number of parameters (model): %i" % sum([p.numel() for p in model.parameters() if p.requires_grad]))
 
         return model.cuda()
-    elif params.exp_name == "wikisum":
+    elif params.WS:
         # build
         global_encoder = Global_Transformer(params)
         local_encoder = TransformerModel(params, dico, is_encoder=True, with_output=True)

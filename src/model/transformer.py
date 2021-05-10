@@ -1063,9 +1063,9 @@ class Global_Transformer(nn.Module):
         self.attention_dropout = params.attention_dropout
         assert self.dim % self.n_heads == 0, 'transformer dim must be a multiple of n_heads'
 
-        # # embedding
-        # self.title_embeddings = Embedding(2, self.dim)
-        # self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
+        # embedding
+        self.title_embeddings = Embedding(2, self.dim)
+        self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
 
         # transformer layers
         self.attentions = nn.ModuleList()
@@ -1088,16 +1088,15 @@ class Global_Transformer(nn.Module):
         mask, attn_mask = get_masks(slen, lengths, causal=False, is_decoder=False)
         global_mask=lengths != 0
 
-        # # embeddings
-        # tensor = input + self.title_embeddings(title_emb)
-        # tensor = self.layer_norm_emb(tensor)
-        # tensor = F.dropout(tensor, p=self.dropout, training=self.training)
-        # tensor *= mask.unsqueeze(-1).to(tensor.dtype)
+        # embeddings
+        tensor = input + self.title_embeddings(title_emb)
+        tensor = self.layer_norm_emb(tensor)
+        tensor = F.dropout(tensor, p=self.dropout, training=self.training)
+        tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
         # transformer layers
         tensor=input
         for i in range(self.n_layers):
-            if i < self.n_layers-1: continue
             # self attention
             attn = self.attentions[i](tensor, attn_mask, global_mask)
             attn = F.dropout(attn, p=self.dropout, training=self.training)    # (bs, n_paragraphs, dim)
@@ -1109,7 +1108,7 @@ class Global_Transformer(nn.Module):
             tensor = self.layer_norm2[i](tensor)
 
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
-            
+            # break
         return tensor
 
 class BeamHypotheses(object):

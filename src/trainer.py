@@ -176,7 +176,7 @@ class Trainer(object):
 
         # model optimizer (excluding memory values)
         self.optimizers['model'] = get_optimizer([
-                # {'params': self.parameters['fine-tune'], 'lr': 1e-5},
+                {'params': self.parameters['fine-tune'], 'lr': 1e-5},
                 {'params': self.parameters['rand_init']}
             ], params.optimizer)
 
@@ -574,7 +574,7 @@ class Trainer(object):
                     param_group['lr'] = self.optimizers[name].get_lr_for_step(param_group['num_updates'])
 
         # reload main metrics
-        self.epoch = data['epoch'] + 1
+        self.epoch = data['epoch']
         self.n_total_iter = data['n_total_iter']
         self.best_metrics = data['best_metrics']
         self.best_stopping_criterion = data['best_stopping_criterion']
@@ -620,19 +620,17 @@ class Trainer(object):
                 logger.info("New best validation score: %f" % self.best_stopping_criterion)
                 self.decrease_counts = 0
             else:
+                self.decrease_counts += 1
                 logger.info("Not a better validation score (%i / %i)."
                             % (self.decrease_counts, self.decrease_counts_max))
                 logger.info("Best validation score: %f" % self.best_stopping_criterion)
-                self.decrease_counts += 1
-            if self.decrease_counts > self.decrease_counts_max:
-                logger.info("Stopping criterion has been below its best value for more "
-                            "than %i epochs. Ending the experiment..." % self.decrease_counts_max)
+            if self.decrease_counts >= self.decrease_counts_max:
+                logger.info("Stopping criterion has been below its best value for %i epochs. Ending the experiment..." % self.decrease_counts_max)
                 if self.params.multi_gpu and 'SLURM_JOB_ID' in os.environ:
                     os.system('scancel ' + os.environ['SLURM_JOB_ID'])
                 exit()
             self.n_iter=0
         self.save_checkpoint('checkpoint', include_optimizers=True)
-        self.epoch += 1
 
     def round_batch(self, x, lengths, positions, langs):
         """
@@ -1015,7 +1013,7 @@ class WikisumTrainer(Trainer):
         lang1_id = params.lang2id[lang1]
         lang2_id = params.lang2id[lang2]
         
-        inputs, ilen, target, tlen = batch
+        inputs, ilen, target, tlen, _ = batch
 
         # print("target:")
         # print(' '.join([self.data["dico"][id] for id in target[:, 0].tolist()]))

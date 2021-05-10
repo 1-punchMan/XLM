@@ -217,6 +217,8 @@ def get_parser():
                         help="Master port (for multi-node SLURM jobs)")
 
     # Wikisum
+    parser.add_argument("--WS", type=bool_flag, default=False,
+                        help="The task is Wikisum.")
     parser.add_argument("--n_paragraphs", type=int, default=5,
                         help="# of reference paragraphs to use")
 
@@ -241,7 +243,7 @@ def main(params):
     # build model
     if params.encoder_only:
         model = build_model(params, data['dico'])
-    elif params.exp_name == "wikisum":
+    elif params.WS:
         global_encoder, local_encoder, decoder = build_model(params, data['dico'])
     else:
         encoder, decoder = build_model(params, data['dico'])
@@ -263,6 +265,7 @@ def main(params):
     
     # language model training
     for _ in range(params.max_epoch):
+        trainer.epoch += 1
 
         logger.info("============ Starting epoch %i ... ============" % trainer.epoch)
 
@@ -274,7 +277,7 @@ def main(params):
 
             trainer.iter()
             # if i > 1000:
-            #     break 
+            # break 
         
         logger.info("============ End of epoch %i ============" % trainer.epoch)
 
@@ -291,7 +294,7 @@ def main(params):
         trainer.save_best_model(scores)
         trainer.save_periodic()
         trainer.end_epoch(scores)
-        break
+        # break
 if __name__ == '__main__':
 
     # generate parser / parse parameters

@@ -6,7 +6,7 @@
 #
 
 from logging import getLogger
-import os, numpy as np, json, pickle
+import os, numpy as np, json, pickle, random
 import torch
 
 from .dataset import StreamDataset, Dataset, ParallelDataset
@@ -424,20 +424,25 @@ def load_wikisum_data(voc_path, dataset_path, params):
     dictionary = Dictionary.read_vocab(voc_path)
     set_dico_parameters(params, data, dictionary)
 
-    DATASET=[]  # 元素格式：(n_file, pos, length)
+    training_data, non_training_data=[], []  # 元素格式：(n_file, pos, length)
     for n_file in range(1000):
         file_path=f"{dataset_path}/index-{n_file:>05}-of-01000.json"
         with open(file_path, 'r', encoding='utf-8') as f:
             indices = json.load(f)
 
-        DATASET+=[(n_file, pos, length) for pos, length in indices]
+        training_data += [(n_file, pos, length) for pos, length in indices["training"]]
+        non_training_data += [(n_file, pos, length) for pos, length in indices["non_training"]]
             
+    random.seed("fuck")
+    random.shuffle(non_training_data)
+    random.seed()
+
     training_set=Wikisum_Dataset(
-        DATASET[:-10000], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
+        training_data, dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
     valid_set=Wikisum_Dataset(
-        DATASET[-10000:-5000][:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
+        non_training_data[:5000][:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
     test_set=Wikisum_Dataset(
-        DATASET[-5000:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
+        non_training_data[5000:], dataset_path, n_paragraphs=params.n_paragraphs, maxlen=params.bptt, dico=dictionary)
     data["datasets"]={
         "training": training_set,
         "valid": valid_set,

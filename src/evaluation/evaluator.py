@@ -561,7 +561,7 @@ class WikisumEvaluator(Evaluator):
         with open(path, 'r', encoding='utf-8') as f:
             sentences=f.readlines()
             sentences=[''.join(sentence[:-1].split(' ')) for sentence in sentences]
-            sentences=[' '.join(list(sentence )) if sentence else ' ' for sentence in sentences]
+            sentences=[' '.join(list(sentence)) for sentence in sentences]
             
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(sentences) + '\n')
@@ -635,8 +635,8 @@ class WikisumEvaluator(Evaluator):
             title_emb=inputs.clone()
             title_emb[:, 0], title_emb[:, 1:]=0, 1
 
-            # global_enc_out=global_encoder(local_enc_out, lengths=ilen, title_emb=title_emb)    # (bs, n_paragraphs, slen, dim)
-            global_enc_out=local_enc_out    # (bs, n_paragraphs, slen, dim)
+            global_enc_out=global_encoder(local_enc_out, lengths=ilen, title_emb=title_emb)    # (bs, n_paragraphs, slen, dim)
+            # global_enc_out=local_enc_out    # (bs, n_paragraphs, slen, dim)
             global_enc_out = global_enc_out.half() if params.fp16 else global_enc_out
 
             target, tlen, langs2, pred_mask, y=[t.cuda() for t in [target, tlen, langs2, pred_mask, y]]
@@ -808,6 +808,7 @@ def eval_moses_bleu(ref, hyp):
         return -1
 
 def eval_rouge(ref, hyp):
+    print(hyp)
     files_rouge = FilesRouge()
     scores = files_rouge.get_scores(hyp, ref, avg=True)
 
