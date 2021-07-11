@@ -1,0 +1,25 @@
+OUTPATH=data/processed/XLM_en_zh/50k
+export CUDA_VISIBLE_DEVICES=1
+python train.py\
+    --exp_name xlm_en_zh\
+	--dump_path ./dumped\
+	--data_path $OUTPATH\
+	--lgs 'en-zh'\
+	--mlm_steps 'en,zh'\
+	--emb_dim 512\
+	--n_layers 6\
+	--n_heads 8\
+	--dropout 0.1\
+	--attention_dropout 0.1\
+	--gelu_activation true\
+	--batch_size 32\
+	--bptt 256\
+	--optimizer adam,lr=0.0001\
+	--epoch_size 300000\
+	--max_epoch 100000\
+	--validation_metrics _valid_mlm_ppl\
+	--stopping_criterion _valid_mlm_ppl,25\
+	--fp16 true\
+	--amp 1\
+	--reload_checkpoint "/home/zchen/XLM/dumped/xlm_en_zh/4bvmypbd3a/checkpoint.pth"
+	#--accumulate_gradients 4
